@@ -19,11 +19,7 @@ import math
 
 import nltk
 from model.corpus import Corpus
-
-# Min and max length for one sentence
-MIN_LENGTH = 2
-MAX_LENGTH = 80
-
+from model.config import MIN_LENGTH, MAX_LENGTH
 
 # Turn a unicode string to plain ASCII
 def unicode_to_ascii(s):

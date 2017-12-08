@@ -9,6 +9,7 @@ import torch
 from torch.autograd import Variable
 
 from model.corpus import PAD_token, UNK_token, SOS_token, EOS_token
+from model.config import USE_CUDA
 
 # Convert each word in a sentence into its index
 def sentences2indexes(corpus, sentence):
@@ -20,7 +21,7 @@ def pad_seq(seq, max_length):
     return seq
 
 # Create a random batch for a specified batch_size
-def random_batch(corpus, pairs, batch_size, USE_CUDA = True):
+def random_batch(corpus, pairs, batch_size):
     input_seqs = []
     target_seqs = []
 

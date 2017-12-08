@@ -2,6 +2,8 @@
 Main script
 """
 import time
+import math
+from random import shuffle
 
 import torch
 import torch.nn as nn
@@ -10,21 +12,14 @@ from torch import optim
 
 from model.model import EncoderRNN, LuongAttnDecoderRNN
 from model.corpus import PAD_token, UNK_token, SOS_token, EOS_token
-from util.process_text import prepare_data, replace_UNK, MIN_LENGTH, MAX_LENGTH
+from util.process_text import prepare_data, replace_UNK
 from util.object_io import save_object, load_object
 from util.text_to_tensor import random_batch
-from util.train_helper import train, evaluate_randomly
+from util.train_helper import train, validate, evaluate_randomly, time_since
 
+# Load config file
+from model.config import *
 
-####################
-### Hyper-parameters
-####################
-USE_CUDA = True
-SAVE_OBJECT = False
-LOAD_OBJECT = True
-# Filter words
-MIN_COUNT = 5
-VOCAB_SIZE = 10000
 
 ####################
 ### Load files
@@ -35,7 +30,7 @@ if LOAD_OBJECT:
     pairs = load_object("./saved/pairs-min-" + str(MIN_COUNT) + "-vocab-" + str(VOCAB_SIZE) + "-lengths-" + str(MIN_LENGTH) + "-" + str(MAX_LENGTH) + ".pkl")
 else:
     # Load file, indexed words and split into pairs
-    corpus, pairs = prepare_data("./data/cornell-movie-dialogs.txt")
+    corpus, pairs = prepare_data("./data/cornell-movie-dialogs.txt", MIN_LENGTH, MAX_LENGTH)
 
     corpus.trim(MIN_COUNT)
     corpus.filter_vocab(VOCAB_SIZE)
@@ -45,31 +40,22 @@ else:
 
     # Save objects
     if SAVE_OBJECT:
-        save_object(corpus, "./saved/corpus-min-" + str(MIN_COUNT) + "-vocab-" + str(VOCAB_SIZE) + "-lengths-" + str(MIN_LENGTH) + "-" + str(MAX_LENGTH) + ".pkl")
-        save_object(pairs, "./saved/pairs-min-" + str(MIN_COUNT) + "-vocab-" + str(VOCAB_SIZE) + "-lengths-" + str(MIN_LENGTH) + "-" + str(MAX_LENGTH) + ".pkl")
+        save_object(corpus, "./saved/corpus-min-{0}-vocab-{1}-lengths-{2}-{3}.pkl".format(MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH))
+        save_object(pairs, "./saved/pairs-min-{0}-vocab-{1}-lengths-{2}-{3}.pkl".format(MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH))
+        
+# Train, validation and test split
+print("Spliting into training, validation and test sets")
+shuffle(pairs)
+val_idx = int(len(pairs) * (1 - val_ratio - test_ratio))
+test_idx = int(len(pairs) * (1 - test_ratio))
+pairs_train = pairs[:val_idx]
+pairs_val = pairs[val_idx:test_idx]
+pairs_test = pairs[test_idx:]
 
 
 ##############################
 ### Train model
 ##############################
-# Model configuration
-attn_model = 'dot'
-embedding_size = 100
-hidden_size = 500
-n_layers = 3
-dropout = 0.1
-batch_size = 128
-
-# Training configuration
-clip = 10
-teacher_forcing_ratio = 0.5
-learning_rate = 0.0001
-decoder_learning_ratio = 5
-n_epochs = 10000
-epoch = 0
-print_every = 100
-evaluate_every = 500
-save_every = 1000
 
 # Initialize model
 encoder = EncoderRNN(corpus.n_words, embedding_size, hidden_size, n_layers, dropout=dropout)
@@ -85,48 +71,50 @@ if USE_CUDA:
     decoder.cuda()
 
 start = time.time()
-plot_losses = []
 print_loss_total = 0
-plot_loss_total = 0
 
-# Train model
-ecs = []
-dcs = []
-eca = 0
-dca = 0
-
+print("Start training...")
 while epoch < n_epochs:
     epoch += 1
 
     # Get training batch
-    input_batches, input_lengths, target_batches, target_lengths = random_batch(corpus, pairs, batch_size)
+    input_batches, input_lengths, target_batches, target_lengths = random_batch(corpus, pairs_train, batch_size)
 
     # Run the train function
     loss, ec, dc = train(
         input_batches, input_lengths, target_batches, target_lengths,
         encoder, decoder, 
         encoder_optimizer, decoder_optimizer, criterion,
-        max_length=MAX_LENGTH, clip=clip
+        clip=clip
     )
 
     # Keep track of loss
     print_loss_total += loss
-    plot_loss_total += loss
-    eca += ec
-    dca += dc
 
     # Print loss
     if epoch % print_every == 0:
+        # Training error
         print_loss_avg = print_loss_total / print_every
+        perplexity = math.exp(float(print_loss_avg)) if print_loss_avg < 300 else float("inf")
         print_loss_total = 0
-        print_summary = '%s (%d %d%%) %.4f' % (time_since(start, epoch / n_epochs), epoch, epoch / n_epochs * 100, print_loss_avg)
+
+        # Validation error
+        input_batches, input_lengths, target_batches, target_lengths = random_batch(corpus, pairs_val, batch_size)
+        error_val = validate(input_batches, input_lengths, target_batches, target_lengths, encoder, decoder)
+        perplexity_val = math.exp(float(error_val)) if error_val < 300 else float("inf")
+
+        print_summary = "{0} (Epoch: {1}, Progress {2}) Loss: {3}, Perplexity: {4}. Validation Loss: {5}, Validation Perplexity: {6}".format(
+            time_since(start, epoch / n_epochs), epoch, epoch / n_epochs * 100, print_loss_avg, perplexity, error_val, perplexity_val)
         print(print_summary)
 
     if epoch % evaluate_every == 0:
-        evaluate_randomly(corpus)
+        # Evaluate random samples from test set
+        evaluate_randomly(corpus, pairs_test, encoder, decoder, MAX_LENGTH)
 
     if epoch % save_every == 0:
-        torch.save(encoder, "./saved/encoder-min-" + str(MIN_COUNT) + "-vocab-" + str(VOCAB_SIZE) + "-lengths-" + str(MIN_LENGTH) + "-" + str(MAX_LENGTH) + ".pt")
-        torch.save(decoder, "./saved/encoder-min-" + str(MIN_COUNT) + "-vocab-" + str(VOCAB_SIZE) + "-lengths-" + str(MIN_LENGTH) + "-" + str(MAX_LENGTH) + ".pt")
+        torch.save(encoder, "./saved/encoder-min-{0}-vocab-{1}-lengths-{2}-{3}-atten-{4}-embed-{5}-hidden-{6}-layers-{7}-dropout-{8}-batch-{9}.pt".format(
+            MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, attn_model, embedding_size, hidden_size, n_layers, dropout, batch_size))
+        torch.save(decoder, "./saved/decoder-min-{0}-vocab-{1}-lengths-{2}-{3}-atten-{4}-embed-{5}-hidden-{6}-layers-{7}-dropout-{8}-batch-{9}.pt".format(
+            MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, attn_model, embedding_size, hidden_size, n_layers, dropout, batch_size))
 
     

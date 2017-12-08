@@ -18,9 +18,8 @@ import torch.nn as nn
 from torch.autograd import Variable
 import torch.nn.functional as F
 
-from util.process_text import MAX_LENGTH
+from model.config import MAX_LENGTH, USE_CUDA
 
-USE_CUDA = True
 
 class EncoderRNN(nn.Module):
     def __init__(self, input_size, embedding_size, hidden_size, n_layers=1, dropout=0.1):
