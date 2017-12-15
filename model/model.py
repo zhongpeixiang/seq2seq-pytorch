@@ -12,13 +12,13 @@ The attention mechanism outputs a context vector, which is the weighted sum of a
 and each encoder output
 The decoder output is computed based on the context vector and current hidden state
 """
-
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.autograd import Variable
 import torch.nn.functional as F
 
-from model.config import MAX_LENGTH, USE_CUDA
+from model.config import MAX_LENGTH, USE_CUDA, GPU_ID
 
 
 class EncoderRNN(nn.Module):
@@ -34,6 +34,8 @@ class EncoderRNN(nn.Module):
         self.embedding = nn.Embedding(input_size, embedding_size)
         self.gru = nn.GRU(embedding_size, hidden_size, n_layers, dropout=dropout, bidirectional=True)
 
+        self.init_weights()
+
     def forward(self, input_seqs, input_lengths, hidden=None):
         embedded = self.embedding(input_seqs)
         packed = torch.nn.utils.rnn.pack_padded_sequence(embedded, input_lengths)
@@ -41,6 +43,9 @@ class EncoderRNN(nn.Module):
         outputs, output_lengths = torch.nn.utils.rnn.pad_packed_sequence(outputs)
         outputs = outputs[:, :, :self.hidden_size] + outputs[:, :, self.hidden_size:] # Sum bidirectional outputs
         return outputs, hidden # (seq_len, batch, hidden_size), (num_layers * num_directions, batch, hidden_size)
+
+    def init_weights(self):
+        self.embedding.weight = nn.Parameter(torch.Tensor(np.random.uniform(-0.1, 0.1, (self.input_size, self.embedding_size))))
 
 class Attn(nn.Module):
     def __init__(self, method, hidden_size):
@@ -62,7 +67,7 @@ class Attn(nn.Module):
 
         attn_energies = Variable(torch.zeros(this_batch_size, max_len)) # (batch_size, max_length)
         if USE_CUDA:
-            attn_energies = attn_energies.cuda()
+            attn_energies = attn_energies.cuda(GPU_ID)
         
         # For each sample in the batch
         for b in range(this_batch_size):
@@ -102,6 +107,8 @@ class BahdanauAttnDecoderRNN(nn.Module):
         self.gru = nn.GRU(embedding_size, hidden_size, n_layers, dropout=dropout_p)
         self.out = nn.Linear(hidden_size, output_size)
 
+        self.init_weights()
+
     def forward(self, word_input, last_hidden, encoder_outputs):
         # Get embedding vector of last output word
         word_embedded = self.embedding(word_input).view(1, 1, -1)
@@ -122,6 +129,9 @@ class BahdanauAttnDecoderRNN(nn.Module):
 
         # Return final output, hidden state and attention weights
         return output, hidden, attn_weights
+    
+    def init_weights(self):
+        self.embedding.weight = nn.Parameter(torch.Tensor(np.random.uniform(-0.1, 0.1, (self.output_size, self.embedding_size))))
 
 class LuongAttnDecoderRNN(nn.Module):
     def __init__(self, attn_model, embedding_size, hidden_size, output_size, n_layers=1, dropout=0.1):
@@ -145,6 +155,8 @@ class LuongAttnDecoderRNN(nn.Module):
         # Choose attention model
         if attn_model != 'none':
             self.attn = Attn(attn_model, hidden_size)
+        
+        self.init_weights()
 
     def forward(self, input_seq, last_hidden, encoder_outputs):
         # Get the embedding of the current input word (last output word)
@@ -173,4 +185,7 @@ class LuongAttnDecoderRNN(nn.Module):
 
         # Return final output, hidden state, and attention weights (for visualization)
         return output, hidden, attn_weights
+
+    def init_weights(self):
+        self.embedding.weight = nn.Parameter(torch.Tensor(np.random.uniform(-0.1, 0.1, (self.output_size, self.embedding_size))))
 

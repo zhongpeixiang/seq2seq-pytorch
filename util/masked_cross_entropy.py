@@ -1,6 +1,7 @@
 import torch
 from torch.nn import functional
 from torch.autograd import Variable
+from model.config import GPU_ID
 
 def sequence_mask(sequence_length, max_len=None):
     if max_len is None:
@@ -10,14 +11,14 @@ def sequence_mask(sequence_length, max_len=None):
     seq_range_expand = seq_range.unsqueeze(0).expand(batch_size, max_len)
     seq_range_expand = Variable(seq_range_expand)
     if sequence_length.is_cuda:
-        seq_range_expand = seq_range_expand.cuda()
+        seq_range_expand = seq_range_expand.cuda(GPU_ID)
     seq_length_expand = (sequence_length.unsqueeze(1)
                          .expand_as(seq_range_expand))
     return seq_range_expand < seq_length_expand
 
 
 def masked_cross_entropy(logits, target, length):
-    length = Variable(torch.LongTensor(length)).cuda()
+    length = Variable(torch.LongTensor(length)).cuda(GPU_ID)
 
     """
     Args:

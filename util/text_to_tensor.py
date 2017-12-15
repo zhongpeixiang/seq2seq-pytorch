@@ -9,7 +9,7 @@ import torch
 from torch.autograd import Variable
 
 from model.corpus import PAD_token, UNK_token, SOS_token, EOS_token
-from model.config import USE_CUDA
+from model.config import USE_CUDA, GPU_ID
 
 # Convert each word in a sentence into its index
 def sentences2indexes(corpus, sentence):
@@ -46,8 +46,8 @@ def random_batch(corpus, pairs, batch_size):
     target_tensor = Variable(torch.LongTensor(target_padded)).transpose(0, 1)
 
     if USE_CUDA:
-        input_tensor = input_tensor.cuda()
-        target_tensor = target_tensor.cuda()
+        input_tensor = input_tensor.cuda(GPU_ID)
+        target_tensor = target_tensor.cuda(GPU_ID)
     
     return input_tensor, input_lengths, target_tensor, target_lengths
 

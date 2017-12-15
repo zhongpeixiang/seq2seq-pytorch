@@ -19,7 +19,7 @@ import math
 
 import nltk
 from model.corpus import Corpus
-from model.config import MIN_LENGTH, MAX_LENGTH
+from model.config import MIN_LENGTH, MAX_LENGTH, REVERSE_INPUT
 
 # Turn a unicode string to plain ASCII
 def unicode_to_ascii(s):
@@ -61,6 +61,8 @@ def filter_pairs(pairs):
     filter_pairs = []
     for pair in pairs:
         if len(pair[0]) >= MIN_LENGTH and len(pair[0]) <= MAX_LENGTH and len(pair[1]) >= MIN_LENGTH and len(pair[1]) <= MAX_LENGTH:
+            if REVERSE_INPUT:
+                pair[0] = " ".join([w for w in reversed(pair[0].split(" "))]).strip()
             filter_pairs.append(pair)
     return filter_pairs
 
