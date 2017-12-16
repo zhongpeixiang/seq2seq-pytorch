@@ -18,7 +18,7 @@ import torch.nn as nn
 from torch.autograd import Variable
 import torch.nn.functional as F
 
-from model.config import MAX_LENGTH, USE_CUDA, GPU_ID
+from model.config import USE_CUDA, GPU_ID
 
 
 class EncoderRNN(nn.Module):
@@ -90,7 +90,7 @@ class Attn(nn.Module):
         return energy
 
 class BahdanauAttnDecoderRNN(nn.Module):
-    def __init__(self, embedding_size, hidden_size, output_size, max_length=MAX_LENGTH, n_layers=1, dropout_p=0.1):
+    def __init__(self, embedding_size, hidden_size, output_size, n_layers=1, dropout_p=0.1):
         super(BahdanauAttnDecoderRNN, self).__init__()
 
         self.hidden_size = hidden_size
@@ -98,7 +98,6 @@ class BahdanauAttnDecoderRNN(nn.Module):
         self.output_size = output_size
         self.n_layers = n_layers
         self.dropout_p = dropout_p
-        self.max_length = max_length
 
         # Define layers
         self.embedding = nn.Embedding(output_size, embedding_size)
@@ -166,7 +165,7 @@ class LuongAttnDecoderRNN(nn.Module):
         embedded = embedded.view(1, batch_size, self.embedding_size) # S=1 x B x N
 
         # Get current hidden state from input word and last hidden state
-        rnn_output, hidden = self.gru(embedded, last_hidden)
+        rnn_output, hidden = self.gru(embedded, last_hidden) # output (seq_len, batch, hidden_size * num_directions), h_n (num_layers * num_directions, batch, hidden_size)
 
         # Calculate attention from current RNN state and all encoder outputs;
         # apply to encoder outputs to get weighted average

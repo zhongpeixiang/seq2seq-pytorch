@@ -46,7 +46,7 @@ class Corpus:
 
     # Remove words below a certain count threshold
     def trim(self, min_count):
-        if self.trimmed: return
+        if self.trimmed or min_count <= 1: return
         self.trimmed = True
         
         keep_words = []

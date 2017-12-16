@@ -1,9 +1,10 @@
 """
 Main script
 """
+import sys
 import time
 import math
-from random import shuffle
+import random
 
 import numpy as np
 import torch
@@ -13,7 +14,7 @@ from torch import optim
 
 from model.model import EncoderRNN, LuongAttnDecoderRNN
 from model.corpus import PAD_token, UNK_token, SOS_token, EOS_token
-from util.process_text import prepare_data, replace_UNK
+from util.process_text import prepare_data, replace_UNK, remove_UNK
 from util.object_io import save_object, load_object
 from util.text_to_tensor import random_batch
 from util.train_helper import train, validate, evaluate_randomly, time_since
@@ -31,27 +32,41 @@ with open("./model/config.py", 'r') as fin:
 ####################
 # Load objects
 if LOAD_CORPUS:
-    print("Loading model...")
-    corpus = load_object("./saved/{5}/corpus/corpus-min-{0}-vocab-{1}-lengths-{2}-{3}-reversed-{4}.pkl".format(MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, REVERSE_INPUT, CORPUS))
-    pairs = load_object("./saved/{5}/corpus/pairs-min-{0}-vocab-{1}-lengths-{2}-{3}-reversed-{4}.pkl".format(MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, REVERSE_INPUT, CORPUS))
+    corpus = load_object("./saved/{5}/corpus/corpus-min-{0}-vocab-{1}-lengths-{2}-{3}-replace-{6}-reversed-{4}.pkl".format(MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, REVERSE_INPUT, CORPUS, REPLACE_UNK))
+    pairs = load_object("./saved/{5}/corpus/pairs-min-{0}-vocab-{1}-lengths-{2}-{3}-replace-{6}-reversed-{4}.pkl".format(MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, REVERSE_INPUT, CORPUS, REPLACE_UNK))
+    print("Vocab size: ", len(corpus.word2index))
+    print("Number of samples: ", len(pairs))
 else:
     # Load file, indexed words and split into pairs
-    corpus, pairs = prepare_data("./data/cornell-movie-dialogs.txt")
+    corpus, pairs = prepare_data(EXTERNAL_DATA_DIR + DATA_FILE)
 
+    # Filter words
     corpus.trim(MIN_COUNT)
     corpus.filter_vocab(VOCAB_SIZE)
 
-    # Replace unknown words by UNK token
-    pairs = replace_UNK(corpus, pairs)
+    if REPLACE_UNK:
+        # Replace unknown words by UNK token
+        pairs = replace_UNK(corpus, pairs)
+    else:
+        # Remove pairs that contain unknown words
+        pairs = remove_UNK(corpus, pairs)
+    print("Vocab size: ", len(corpus.word2index))
+    print("Number of samples: ", len(pairs))
 
     # Save objects
     if SAVE_CORPUS:
-        save_object(corpus, "./saved/{5}/corpus/corpus-min-{0}-vocab-{1}-lengths-{2}-{3}-reversed-{4}.pkl".format(MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, REVERSE_INPUT, CORPUS))
-        save_object(pairs, "./saved/{5}/corpus/pairs-min-{0}-vocab-{1}-lengths-{2}-{3}-reversed-{4}.pkl".format(MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, REVERSE_INPUT, CORPUS))
-        
+        save_object(corpus, "./saved/{5}/corpus/corpus-min-{0}-vocab-{1}-lengths-{2}-{3}-replace-{6}-reversed-{4}.pkl".format(MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, REVERSE_INPUT, CORPUS, REPLACE_UNK))
+        save_object(pairs, "./saved/{5}/corpus/pairs-min-{0}-vocab-{1}-lengths-{2}-{3}-replace-{6}-reversed-{4}.pkl".format(MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, REVERSE_INPUT, CORPUS, REPLACE_UNK))
+    
+    # If intend to create corpus only, exit now
+    if CREATE_CORPUS_ONLY:
+        sys.exit()
+
+
 # Train, validation and test split
 print("Spliting into training, validation and test sets")
-shuffle(pairs)
+random.seed(SEED)
+random.shuffle(pairs)
 val_idx = int(len(pairs) * (1 - val_ratio - test_ratio))
 test_idx = int(len(pairs) * (1 - test_ratio))
 pairs_train = pairs[:val_idx]
@@ -63,6 +78,7 @@ pairs_test = pairs[test_idx:]
 ### Train model
 ##############################
 if LOAD_MODEL:
+    print("Loading model...")
     encoder = torch.load("./saved/{12}/model/encoder-min-{0}-vocab-{1}-lengths-{2}-{3}-atten-{4}-embed-{5}-hidden-{6}-layers-{7}-dropout-{8}-batch-{9}-teacher-{10}-learn-{11}.pt".format(
             MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, attn_model, embedding_size, hidden_size, n_layers, dropout, batch_size, teacher_forcing_ratio, learning_rate, CORPUS))
     decoder = torch.load("./saved/{12}/model/decoder-min-{0}-vocab-{1}-lengths-{2}-{3}-atten-{4}-embed-{5}-hidden-{6}-layers-{7}-dropout-{8}-batch-{9}-teacher-{10}-learn-{11}.pt".format(
@@ -154,7 +170,7 @@ else:
 
         if epoch % evaluate_every == 0:
             # Evaluate random samples from test set
-            evaluate_randomly(corpus, pairs_test, encoder, decoder, 10)
+            evaluate_randomly(corpus, pairs_test, encoder, decoder, MAX_LENGTH)
 
         if epoch % save_every == 0 and SAVE_MODEL:
             torch.save(encoder, "./saved/{12}/model/encoder-min-{0}-vocab-{1}-lengths-{2}-{3}-atten-{4}-embed-{5}-hidden-{6}-layers-{7}-dropout-{8}-batch-{9}-teacher-{10}-learn-{11}.pt".format(

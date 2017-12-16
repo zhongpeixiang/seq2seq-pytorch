@@ -47,9 +47,11 @@ def read_corpus(filename):
     corpus_name = os.path.split(filename)[1].split('.')[0]
 
     # Read the file and split into lines
+    print("Spliting lines...")
     lines = open(filename).read().strip().split('\n')
 
     # Split every line into pairs of Q and A
+    print("Creating pairs...")
     pairs = [[normalize_string(s) for s in l.split('\t')] for l in lines]
 
     corpus = Corpus(corpus_name)
@@ -60,7 +62,7 @@ def read_corpus(filename):
 def filter_pairs(pairs):
     filter_pairs = []
     for pair in pairs:
-        if len(pair[0]) >= MIN_LENGTH and len(pair[0]) <= MAX_LENGTH and len(pair[1]) >= MIN_LENGTH and len(pair[1]) <= MAX_LENGTH:
+        if len(pair[0].split(" ")) >= MIN_LENGTH and len(pair[0].split(" ")) <= MAX_LENGTH and len(pair[1].split(" ")) >= MIN_LENGTH and len(pair[1].split(" ")) <= MAX_LENGTH:
             if REVERSE_INPUT:
                 pair[0] = " ".join([w for w in reversed(pair[0].split(" "))]).strip()
             filter_pairs.append(pair)
@@ -71,21 +73,21 @@ def filter_pairs_truncated(pairs):
     filter_pairs = []
     for pair in pairs:
         if len(pair[0]) >= MIN_LENGTH and len(pair[1]) >= MIN_LENGTH:
-            if len(pair[0]) <= MAX_LENGTH:
+            if len(pair[0].split(" ")) <= MAX_LENGTH:
                 sents = nltk.sent_tokenize(pair[0])
                 new_sent = ''
                 # Keep the sentences at the end for questions
                 for sent in reversed(sents):
-                    if len(new_sent + sent) > MAX_LENGTH:
+                    if len((new_sent + sent).split(" ")) > MAX_LENGTH:
                         break
                     new_sent = " " + sent + new_sent
                 pair[0] = new_sent.strip()
-            if len(pair[1]) <= MAX_LENGTH:
+            if len(pair[1].split(" ")) <= MAX_LENGTH:
                 sents = nltk.sent_tokenize(pair[1])
                 new_sent = ''
                 # Keep the sentences at the begining for answers
                 for sent in sents:
-                    if len(new_sent + sent) > MAX_LENGTH:
+                    if len((new_sent + sent).split(" ")) > MAX_LENGTH:
                         break
                     new_sent += sent + " "
                 pair[1] = new_sent.strip()
@@ -138,4 +140,29 @@ def replace_UNK(corpus, pairs):
         new_pairs.append((new_input_sentence.strip(), new_output_sentence.strip()))
 
     print("Replaced {0} UNK in {1} words: {2}%".format(UNK_count, total_count, 100*UNK_count/total_count))
+    return new_pairs
+
+
+# Replace unknown words by UNK token
+def remove_UNK(corpus, pairs):
+    before_remove_count = len(pairs)
+    new_pairs = []
+
+    for pair in pairs:
+        keep_input = True
+        keep_output = True
+
+        for word in pair[0].split(' '):
+            if word not in corpus.word2index:
+                keep_input = False
+
+        for word in pair[1].split(' '):
+            if word not in corpus.word2index:
+                keep_output = False
+
+        if keep_input and keep_output:
+            new_pairs.append(pair)
+    
+    after_remove_count = len(new_pairs)
+    print("Keep {0} from {1} pairs; Ratio: {2:.2f}%".format(after_remove_count, before_remove_count, 100*after_remove_count/before_remove_count))
     return new_pairs

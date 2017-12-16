@@ -14,7 +14,7 @@ from torch.autograd import Variable
 from model.corpus import PAD_token, UNK_token, SOS_token, EOS_token
 from util.text_to_tensor import sentences2indexes
 from util.masked_cross_entropy import masked_cross_entropy
-from model.config import MAX_LENGTH, USE_CUDA, GPU_ID, teacher_forcing_ratio, beam_size
+from model.config import USE_CUDA, GPU_ID, teacher_forcing_ratio, beam_size
 
 
 # Convert seconds into minutes and seconds
@@ -133,7 +133,7 @@ def validate(input_batches, input_lengths, target_batches, target_lengths, encod
     return loss.data[0]
 
 # Evaluate single word and produce sentence output
-def evaluate(corpus, encoder, decoder, input_seq, max_length=MAX_LENGTH):
+def evaluate(corpus, encoder, decoder, input_seq, max_length):
     # Input sequence
     input_lengths = [len(input_seq)]
     input_seqs = [sentences2indexes(corpus, input_seq)]
@@ -329,9 +329,9 @@ def evaluate(corpus, encoder, decoder, input_seq, max_length=MAX_LENGTH):
     return decoded_words, decoder_attentions[:idx+1, :len(encoder_outputs)]
 
 # Randomly evaluate a pair from a corpus
-def evaluate_randomly(corpus, pairs, encoder, decoder, max_length=MAX_LENGTH):
+def evaluate_randomly(corpus, pairs, encoder, decoder, max_length):
     [input_sentence, target_sentence] = random.choice(pairs)
-    output_words, attentions = evaluate(corpus, encoder, decoder, input_sentence, max_length=max_length)
+    output_words, attentions = evaluate(corpus, encoder, decoder, input_sentence, max_length)
     output_sentences = [" ".join(output_sent) for output_sent in output_words]
     print('>', input_sentence)
     if target_sentence is not None:
