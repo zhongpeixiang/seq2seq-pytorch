@@ -3,6 +3,7 @@ This is the Corpus class for indexing and filtering words in the corpus
 It has three dictionaries: word2index, index2word and word2count
 It has two methods for filtering words based on min word count and vocabulary size limit
 """
+
 PAD_token = 0
 UNK_token = 1
 SOS_token = 2
@@ -22,7 +23,7 @@ class Corpus:
     def init_dict(self, keep_words=None):
         # initialize dictionaries
         self.word2index = {"PAD": 0, "UNK": 1, "SOS": 2, "EOS": 3}
-        self.word2count = {}
+        self.word2count = {"UNK": 0}
         self.index2word = {0: "PAD", 1: "UNK", 2: "SOS", 3: "EOS"}
         self.n_words = 4 # Count default tokens
 
@@ -36,6 +37,9 @@ class Corpus:
         self.word2count_copy = self.word2count.copy()
 
     def index_word(self, word):
+        # If the corpus is opensub from jiwei li, replace all unknown by UNK 
+        if word == "UNknown":
+            word = "UNK"
         if word not in self.word2index:
             self.word2index[word] = self.n_words
             self.word2count[word] = 1

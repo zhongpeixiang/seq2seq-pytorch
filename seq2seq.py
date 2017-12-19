@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 from torch.autograd import Variable
 from torch import optim
+from gensim.models.keyedvectors import KeyedVectors
 
 from model.model import EncoderRNN, LuongAttnDecoderRNN
 from model.corpus import PAD_token, UNK_token, SOS_token, EOS_token
@@ -34,15 +35,22 @@ with open("./model/config.py", 'r') as fin:
 if LOAD_CORPUS:
     corpus = load_object("./saved/{5}/corpus/corpus-min-{0}-vocab-{1}-lengths-{2}-{3}-replace-{6}-reversed-{4}.pkl".format(MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, REVERSE_INPUT, CORPUS, REPLACE_UNK))
     pairs = load_object("./saved/{5}/corpus/pairs-min-{0}-vocab-{1}-lengths-{2}-{3}-replace-{6}-reversed-{4}.pkl".format(MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, REVERSE_INPUT, CORPUS, REPLACE_UNK))
-    print("Vocab size: ", len(corpus.word2index))
+    print("Vocab size: ", corpus.n_words)
     print("Number of samples: ", len(pairs))
 else:
     # Load file, indexed words and split into pairs
-    corpus, pairs = prepare_data(EXTERNAL_DATA_DIR + DATA_FILE)
+    corpus, pairs = prepare_data(USE_DIR + DATA_FILE)
 
     # Filter words
+    print("Triming words...")
+    start = time.time()
     corpus.trim(MIN_COUNT)
+    print("Triming took {0:.3f} seconds".format(time.time() - start))
+
+    print("Limiting vocab size...")
+    start = time.time()
     corpus.filter_vocab(VOCAB_SIZE)
+    print("Limiting vocab size took {0:.3f} seconds".format(time.time() - start))
 
     if REPLACE_UNK:
         # Replace unknown words by UNK token
@@ -50,7 +58,7 @@ else:
     else:
         # Remove pairs that contain unknown words
         pairs = remove_UNK(corpus, pairs)
-    print("Vocab size: ", len(corpus.word2index))
+    print("Vocab size: ", corpus.n_words)
     print("Number of samples: ", len(pairs))
 
     # Save objects
@@ -61,6 +69,37 @@ else:
     # If intend to create corpus only, exit now
     if CREATE_CORPUS_ONLY:
         sys.exit()
+
+# Load word2vec embedding
+embedding = None
+if LOAD_WORD2VEC:
+    print("Initializing word2vec embeddings...")
+    if LOAD_NUMPY_WORD2VEC:
+        path = "./saved/{5}/corpus/corpus-min-{0}-vocab-{1}-lengths-{2}-{3}-replace-{6}-reversed-{4}.npy".format(MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, REVERSE_INPUT, CORPUS, REPLACE_UNK)
+        print("Loading word2vec embeddings from " + path)
+        embedding = np.load(path)
+    else:
+        print("Loading word2vec embeddings from " + WORD2VEC_PATH)
+        start = time.time()
+        word_vectors = KeyedVectors.load_word2vec_format(WORD2VEC_PATH, binary=True)
+        embedding = np.zeros((corpus.n_words, word_vectors.vector_size))
+        counter = 0
+
+        for word_id in range(corpus.n_words):
+            word = corpus.index2word[word_id]
+            if word in word_vectors.vocab:
+                counter += 1
+                embedding[word_id] = word_vectors.word_vec(word)
+            else:
+                embedding[word_id] = np.random.uniform(-0.1, 0.1, size=300)
+        
+        if SAVE_NUMPY_WORD2VEC:
+            path = "./saved/{5}/corpus/corpus-min-{0}-vocab-{1}-lengths-{2}-{3}-replace-{6}-reversed-{4}.npy".format(MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, REVERSE_INPUT, CORPUS, REPLACE_UNK)
+            print("Saving word2vec embeddings to " + path)
+            np.save(path, embedding)
+        
+        embedding_size = embedding.shape[1] # Change embedding size to word2vec embedding size
+        print("Finished loading embeddings in {0:.0f} seconds: {1} out of {2} words are using pre-trained embeddings. ".format(time.time(), counter, corpus.n_words))
 
 
 # Train, validation and test split
@@ -79,10 +118,10 @@ pairs_test = pairs[test_idx:]
 ##############################
 if LOAD_MODEL:
     print("Loading model...")
-    encoder = torch.load("./saved/{12}/model/encoder-min-{0}-vocab-{1}-lengths-{2}-{3}-atten-{4}-embed-{5}-hidden-{6}-layers-{7}-dropout-{8}-batch-{9}-teacher-{10}-learn-{11}.pt".format(
-            MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, attn_model, embedding_size, hidden_size, n_layers, dropout, batch_size, teacher_forcing_ratio, learning_rate, CORPUS))
-    decoder = torch.load("./saved/{12}/model/decoder-min-{0}-vocab-{1}-lengths-{2}-{3}-atten-{4}-embed-{5}-hidden-{6}-layers-{7}-dropout-{8}-batch-{9}-teacher-{10}-learn-{11}.pt".format(
-            MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, attn_model, embedding_size, hidden_size, n_layers, dropout, batch_size, teacher_forcing_ratio, learning_rate, CORPUS))
+    encoder = torch.load("./saved/{12}/model/encoder-min-{0}-vocab-{1}-lengths-{2}-{3}-atten-{4}-embed-{5}-word2vec-{13}-hidden-{6}-layers-{7}-dropout-{8}-batch-{9}-teacher-{10}-learn-{11}.pt".format(
+            MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, attn_model, embedding_size, hidden_size, n_layers, dropout, batch_size, teacher_forcing_ratio, learning_rate, CORPUS, LOAD_WORD2VEC))
+    decoder = torch.load("./saved/{12}/model/decoder-min-{0}-vocab-{1}-lengths-{2}-{3}-atten-{4}-embed-{5}-word2vec-{13}-hidden-{6}-layers-{7}-dropout-{8}-batch-{9}-teacher-{10}-learn-{11}.pt".format(
+            MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, attn_model, embedding_size, hidden_size, n_layers, dropout, batch_size, teacher_forcing_ratio, learning_rate, CORPUS, LOAD_WORD2VEC))
 
     print("Start evaluating...")
     while epoch < n_epochs:
@@ -90,8 +129,8 @@ if LOAD_MODEL:
         evaluate_randomly(corpus, pairs_test, encoder, decoder, 10)
 else:
     # Initialize model
-    encoder = EncoderRNN(corpus.n_words, embedding_size, hidden_size, n_layers, dropout=dropout)
-    decoder = LuongAttnDecoderRNN(attn_model, embedding_size, hidden_size, corpus.n_words, n_layers, dropout=dropout)
+    encoder = EncoderRNN(corpus.n_words, embedding_size, hidden_size, n_layers, dropout=dropout, embedding=embedding)
+    decoder = LuongAttnDecoderRNN(attn_model, embedding_size, hidden_size, corpus.n_words, n_layers, dropout=dropout, embedding=embedding)
 
     # Initialize optimizers and criterion
     encoder_optimizer = optim.Adam(encoder.parameters(), lr=learning_rate)
@@ -114,15 +153,21 @@ else:
         epoch += 1
 
         # Get training batch
+        # print("Creating a random batch ...")
+        start = time.time()
         input_batches, input_lengths, target_batches, target_lengths = random_batch(corpus, pairs_train, batch_size)
+        # print("Creating a random batch took {0:.3f} seconds".format(time.time() - start))
 
         # Run the train function
+        # print("Training a random batch ...")
+        start = time.time()
         loss, ec, dc = train(
             input_batches, input_lengths, target_batches, target_lengths,
             encoder, decoder, 
             encoder_optimizer, decoder_optimizer, criterion,
             clip=clip
         )
+        # print("Training a random batch took {0:.3f} seconds".format(time.time() - start))
 
         # Keep track of loss
         print_loss_total += loss
@@ -155,10 +200,10 @@ else:
                     break
             
             # Save losses
-            train_loss_file = "./saved/{12}/loss/train-loss-min-{0}-vocab-{1}-lengths-{2}-{3}-atten-{4}-embed-{5}-hidden-{6}-layers-{7}-dropout-{8}-batch-{9}-teacher-{10}-learn-{11}.txt".format(
-                MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, attn_model, embedding_size, hidden_size, n_layers, dropout, batch_size, teacher_forcing_ratio, learning_rate, CORPUS)
-            val_loss_file = "./saved/{12}/loss/val-loss-min-{0}-vocab-{1}-lengths-{2}-{3}-atten-{4}-embed-{5}-hidden-{6}-layers-{7}-dropout-{8}-batch-{9}-teacher-{10}-learn-{11}.txt".format(
-                MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, attn_model, embedding_size, hidden_size, n_layers, dropout, batch_size, teacher_forcing_ratio, learning_rate, CORPUS)
+            train_loss_file = "./saved/{12}/loss/train-loss-min-{0}-vocab-{1}-lengths-{2}-{3}-atten-{4}-embed-{5}-word2vec-{13}-hidden-{6}-layers-{7}-dropout-{8}-batch-{9}-teacher-{10}-learn-{11}.txt".format(
+                MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, attn_model, embedding_size, hidden_size, n_layers, dropout, batch_size, teacher_forcing_ratio, learning_rate, CORPUS, LOAD_WORD2VEC)
+            val_loss_file = "./saved/{12}/loss/val-loss-min-{0}-vocab-{1}-lengths-{2}-{3}-atten-{4}-embed-{5}-word2vec-{13}-hidden-{6}-layers-{7}-dropout-{8}-batch-{9}-teacher-{10}-learn-{11}.txt".format(
+                MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, attn_model, embedding_size, hidden_size, n_layers, dropout, batch_size, teacher_forcing_ratio, learning_rate, CORPUS, LOAD_WORD2VEC)
             
             with open(train_loss_file,'w') as resultFile:
                 for loss in losses_train_all:
@@ -173,9 +218,9 @@ else:
             evaluate_randomly(corpus, pairs_test, encoder, decoder, MAX_LENGTH)
 
         if epoch % save_every == 0 and SAVE_MODEL:
-            torch.save(encoder, "./saved/{12}/model/encoder-min-{0}-vocab-{1}-lengths-{2}-{3}-atten-{4}-embed-{5}-hidden-{6}-layers-{7}-dropout-{8}-batch-{9}-teacher-{10}-learn-{11}.pt".format(
-                MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, attn_model, embedding_size, hidden_size, n_layers, dropout, batch_size, teacher_forcing_ratio, learning_rate, CORPUS))
-            torch.save(decoder, "./saved/{12}/model/decoder-min-{0}-vocab-{1}-lengths-{2}-{3}-atten-{4}-embed-{5}-hidden-{6}-layers-{7}-dropout-{8}-batch-{9}-teacher-{10}-learn-{11}.pt".format(
-                MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, attn_model, embedding_size, hidden_size, n_layers, dropout, batch_size, teacher_forcing_ratio, learning_rate, CORPUS))
+            torch.save(encoder, "./saved/{12}/model/encoder-min-{0}-vocab-{1}-lengths-{2}-{3}-atten-{4}-embed-{5}-word2vec-{13}-hidden-{6}-layers-{7}-dropout-{8}-batch-{9}-teacher-{10}-learn-{11}.pt".format(
+                MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, attn_model, embedding_size, hidden_size, n_layers, dropout, batch_size, teacher_forcing_ratio, learning_rate, CORPUS, LOAD_WORD2VEC))
+            torch.save(decoder, "./saved/{12}/model/decoder-min-{0}-vocab-{1}-lengths-{2}-{3}-atten-{4}-embed-{5}-word2vec-{13}-hidden-{6}-layers-{7}-dropout-{8}-batch-{9}-teacher-{10}-learn-{11}.pt".format(
+                MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, attn_model, embedding_size, hidden_size, n_layers, dropout, batch_size, teacher_forcing_ratio, learning_rate, CORPUS, LOAD_WORD2VEC))
 
         

@@ -22,7 +22,7 @@ from model.config import USE_CUDA, GPU_ID
 
 
 class EncoderRNN(nn.Module):
-    def __init__(self, input_size, embedding_size, hidden_size, n_layers=1, dropout=0.1):
+    def __init__(self, input_size, embedding_size, hidden_size, n_layers=1, dropout=0.1, embedding=None):
         super(EncoderRNN, self).__init__()
 
         self.input_size = input_size
@@ -32,6 +32,10 @@ class EncoderRNN(nn.Module):
         self.dropout = dropout
 
         self.embedding = nn.Embedding(input_size, embedding_size)
+        # If use word2vec embedding
+        if embedding:
+            self.embedding.weight.data.copy_(torch.from_numpy(embedding))
+        
         self.gru = nn.GRU(embedding_size, hidden_size, n_layers, dropout=dropout, bidirectional=True)
 
         self.init_weights()
@@ -90,7 +94,7 @@ class Attn(nn.Module):
         return energy
 
 class BahdanauAttnDecoderRNN(nn.Module):
-    def __init__(self, embedding_size, hidden_size, output_size, n_layers=1, dropout_p=0.1):
+    def __init__(self, embedding_size, hidden_size, output_size, n_layers=1, dropout_p=0.1, embedding=None):
         super(BahdanauAttnDecoderRNN, self).__init__()
 
         self.hidden_size = hidden_size
@@ -101,6 +105,9 @@ class BahdanauAttnDecoderRNN(nn.Module):
 
         # Define layers
         self.embedding = nn.Embedding(output_size, embedding_size)
+        # If use word2vec embedding
+        if embedding:
+            self.embedding.weight.data.copy_(torch.from_numpy(embedding))
         self.dropout = nn.Dropout(dropout_p)
         self.attn = Attn('concat', hidden_size)
         self.gru = nn.GRU(embedding_size, hidden_size, n_layers, dropout=dropout_p)
@@ -133,7 +140,7 @@ class BahdanauAttnDecoderRNN(nn.Module):
         self.embedding.weight = nn.Parameter(torch.Tensor(np.random.uniform(-0.1, 0.1, (self.output_size, self.embedding_size))))
 
 class LuongAttnDecoderRNN(nn.Module):
-    def __init__(self, attn_model, embedding_size, hidden_size, output_size, n_layers=1, dropout=0.1):
+    def __init__(self, attn_model, embedding_size, hidden_size, output_size, n_layers=1, dropout=0.1, embedding=None):
         super(LuongAttnDecoderRNN, self).__init__()
 
         # Keep for reference
@@ -146,6 +153,9 @@ class LuongAttnDecoderRNN(nn.Module):
 
         # Define layers
         self.embedding = nn.Embedding(output_size, embedding_size)
+        # If use word2vec embedding
+        if embedding:
+            self.embedding.weight.data.copy_(torch.from_numpy(embedding))
         self.embedding_dropout = nn.Dropout(dropout)
         self.gru = nn.GRU(embedding_size, hidden_size, n_layers, dropout=dropout)
         self.concat = nn.Linear(hidden_size * 2, hidden_size)

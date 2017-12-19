@@ -19,7 +19,7 @@ import math
 
 import nltk
 from model.corpus import Corpus
-from model.config import MIN_LENGTH, MAX_LENGTH, REVERSE_INPUT
+from model.config import MIN_LENGTH, MAX_LENGTH, REVERSE_INPUT, LIMIT_PAIRS, CORPUS
 
 # Turn a unicode string to plain ASCII
 def unicode_to_ascii(s):
@@ -30,7 +30,10 @@ def unicode_to_ascii(s):
 
 # Lowercase, trim and remove non-letter characters
 def normalize_string(s):
-    s = unicode_to_ascii(s.lower().strip())
+    if CORPUS == "opensub":
+        s = unicode_to_ascii(s.strip())
+    else:
+        s = unicode_to_ascii(s.lower().strip())
     s = re.sub(r"([,.!?])", r" \1 ", s)
     s = re.sub(r"[^a-zA-Z,.!?]+", r" ", s)
     s = re.sub(r"\s+", r" ", s).strip()
@@ -48,11 +51,16 @@ def read_corpus(filename):
 
     # Read the file and split into lines
     print("Spliting lines...")
+    start = time.time()
     lines = open(filename).read().strip().split('\n')
+    lines = lines[:LIMIT_PAIRS]
+    print("Spliting lines took {0:.3f} seconds.".format(time.time() - start))
 
     # Split every line into pairs of Q and A
     print("Creating pairs...")
+    start = time.time()
     pairs = [[normalize_string(s) for s in l.split('\t')] for l in lines]
+    print("Creating pairs took {0:.3f} seconds.".format(time.time() - start))
 
     corpus = Corpus(corpus_name)
 
@@ -99,14 +107,17 @@ def prepare_data(filename):
     corpus, pairs = read_corpus(filename)
     print("Read {0} sentence pairs".format(len(pairs)))
 
+    start = time.time()
     pairs = filter_pairs(pairs)
-    print("Filtered to {0} sentence pairs".format(len(pairs)))
+    print("Filtered to {0} sentence pairs, took {1:.3f} seconds".format(len(pairs), time.time() - start))
+    
 
     print("Building corpus and indexing words...")
+    start = time.time()
     for pair in pairs:
         corpus.index_words(pair[0])
         corpus.index_words(pair[1])
-    print("Indexed {0} words in the corpus".format(corpus.n_words))
+    print("Indexed {0} words in the corpus, took {1:.3f} seconds".format(corpus.n_words, time.time() - start))
     return corpus, pairs
 
 # Replace unknown words by UNK token

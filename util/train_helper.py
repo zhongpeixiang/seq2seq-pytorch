@@ -14,7 +14,7 @@ from torch.autograd import Variable
 from model.corpus import PAD_token, UNK_token, SOS_token, EOS_token
 from util.text_to_tensor import sentences2indexes
 from util.masked_cross_entropy import masked_cross_entropy
-from model.config import USE_CUDA, GPU_ID, teacher_forcing_ratio, beam_size
+from model.config import USE_CUDA, GPU_ID, teacher_forcing_ratio, beam_size, alpha
 
 
 # Convert seconds into minutes and seconds
@@ -39,15 +39,23 @@ def train(input_batches, input_lengths, target_batches, target_lengths, encoder,
     loss = 0
 
     batch_size = len(input_lengths)
-
+    # print("Batch size: ", batch_size)
+    # print("Input lengths: ", input_lengths)
+    # print("Target lengths: ", target_lengths)
     # Encoder
+    # print("Encoding a random batch ...")
+    start = time.time()
     encoder_outputs, encoder_hidden = encoder(input_batches, input_lengths, None)
+    # print("Encoding a random batch took {0:.3f} seconds".format(time.time() - start))
 
     # Decoder
+    # print("Decoding a random batch ...")
+    start = time.time()
     decoder_input = Variable(torch.LongTensor([SOS_token] * batch_size))
     decoder_hidden = encoder_hidden[:decoder.n_layers]
 
     max_target_length = max(target_lengths)
+    # print("max_target_length: ", max_target_length)
     all_decoder_outputs = Variable(torch.zeros(max_target_length, batch_size, decoder.output_size))
 
     if USE_CUDA:
@@ -57,7 +65,10 @@ def train(input_batches, input_lengths, target_batches, target_lengths, encoder,
     # Run through decoder one by one
     if random.random() <= teacher_forcing_ratio:
         for t in range(max_target_length):
+            # print("Decoding at position {0} ...".format(t))
+            start = time.time()
             decoder_output, decoder_hidden, decoder_attn = decoder(decoder_input, decoder_hidden, encoder_outputs)
+            # print("Decoding at position {0} took  {1}...".format(t, time.time() - start))
             all_decoder_outputs[t] = decoder_output
             decoder_input = target_batches[t] # Next input is current target, fully teacher forcing
     else:
@@ -70,8 +81,10 @@ def train(input_batches, input_lengths, target_batches, target_lengths, encoder,
             decoder_input = Variable(topi.squeeze(1))
             if USE_CUDA:
                 decoder_input = decoder_input.cuda(GPU_ID)
-    
+    # print("Decoding a random batch took {0:.3f} seconds".format(time.time() - start))
     # Loss and optimization
+    # print("Loss and optimization ...")
+    start = time.time()
     loss = masked_cross_entropy(
         all_decoder_outputs.transpose(0, 1).contiguous(), # -> batch x seq
         target_batches.transpose(0, 1).contiguous(), # -> batch x seq
@@ -85,6 +98,7 @@ def train(input_batches, input_lengths, target_batches, target_lengths, encoder,
 
     encoder_optimizer.step()
     decoder_optimizer.step()
+    # print("Loss and optimization took {0:.3f} seconds".format(time.time() - start))
 
     return loss.data[0], ec, dc
 
@@ -160,109 +174,6 @@ def evaluate(corpus, encoder, decoder, input_seq, max_length):
     decoded_words = []
     decoder_attentions = torch.zeros(max_length + 1, max_length + 1)
 
-    # Beam search
-    """
-    for idx in range(max_length):
-        # Count how many beams have EOS already
-        EOS_count = 0
-        for is_eos in is_EOS:
-            if is_eos:
-                EOS_count += 1
-        # print(idx)
-        # print(decoder_input.size())
-        # print(type(decoder_input))
-        # print(decoder_hidden.size())
-        # print(type(decoder_hidden))
-        # print(encoder_outputs.size())
-        # print(type(encoder_outputs))
-        print(is_EOS)
-        decoder_output, decoder_hidden, decoder_attention = decoder(
-            decoder_input, decoder_hidden, encoder_outputs
-        )
-        # decoder_attentions[idx,:decoder_attention.size(2)] += decoder_attention.squeeze(0).squeeze(0).cpu().data
-
-        # deocder_output: (beam_size, vocab_size)
-        # Choose beam_size of top word from output
-        topv, topi = decoder_output.data.topk(beam_size, 1, largest=True, sorted=True) # (beam_size, beam_size) or (1, beam_size) for the first time
-        # print(topv.size())
-        # print(topi.size())
-        if not first:
-            # Add mask for EOS
-            for i in range(beam_size):
-                if is_EOS[i]:
-                    prev_ks[i] = 0 # Ignore beams with EOS already
-            print(prev_ks)
-            topv = torch.FloatTensor(prev_ks.cpu().numpy()[:, np.newaxis] * topv.cpu().numpy()).cuda(GPU_ID) # Multiply with previous probs
-        prev_ks = topv.view(-1).topk(beam_size)[0] # Probs for words in beams without EOS
-        # print(topv.size())
-        # print(prev_ks.size())
-        # decoder_input = Variable(topi.view(-1)[topv.view(-1).topk(beam_size)[1]]) # (beam_size, )
-        if first:
-            decoder_input = decoder_input.repeat(beam_size)
-            decoder_hidden = decoder_hidden.repeat(1, beam_size, 1)
-            encoder_outputs = encoder_outputs.repeat(1, beam_size, 1)
-        
-        # Add ids to output word
-        top_indexes = top_n_indexes(topv.cpu().numpy(), beam_size) # Select top n indexes whose value are the largest
-        top_indexes = sorted(top_indexes, key=lambda a: topv.cpu().numpy()[a], reverse=True) # Sort these indexes in ascending order
-        
-        new_prev_ids = prev_ids
-        for i, top_idx in enumerate(top_indexes):
-
-            # Use words with top probs as input
-            decoder_input[i] = topi[top_idx] # (beam_size, )
-            
-            # If this beam does not contain EOS
-            if is_EOS[top_idx[0]] == False:
-                new_prev_ids[i] = prev_ids[top_idx[0]]
-                new_prev_ids[i][idx + 1] = topi[top_idx]
-                
-            if topi[top_idx] == EOS_token and is_EOS[top_idx[0]] == False:
-                print("Adding decoded beam...")
-                print(i, top_idx, topi[top_idx])
-                is_EOS[top_idx[0]] = True
-                decoded_beams.append(new_prev_ids[i]) # Add this beam with EOS to the list for decoded beams
-
-        prev_ids = new_prev_ids
-        if USE_CUDA:
-            decoder_input = decoder_input.cuda(GPU_ID)
-        first = False
-
-        # Stop decoding if all beams contain EOS
-        print("Number of decoded beams: ", len(decoded_beams))
-        if len(decoded_beams) == beam_size:
-            print("All beams are finished decoding...")
-            break
-    
-    # print(prev_ids)
-    # Output words
-    for idx in range(len(decoded_beams)):
-        decoded_words.append([corpus.index2word[word_id] for word_id in decoded_beams[idx]])
-    
-    """
-
-    """
-    # Run through decoder
-    for idx in range(max_length):
-        decoder_output, decoder_hidden, decoder_attention = decoder(
-            decoder_input, decoder_hidden, encoder_outputs
-        )
-        decoder_attentions[idx,:decoder_attention.size(2)] += decoder_attention.squeeze(0).squeeze(0).cpu().data
-
-        # Choose top word from output
-        topv, topi = decoder_output.data.topk(1)
-        ni = topi[0][0]
-        if ni == EOS_token:
-            decoded_words.append('<EOS>')
-            break
-        else:
-            decoded_words.append(corpus.index2word[ni])
-        
-        # Next input is chosen top word
-        decoder_input = Variable(torch.LongTensor([ni]))
-        if USE_CUDA:
-            decoder_input = decoder_input.cuda(GPU_ID)
-    """
     # Beam search
     first = True
     node_list = []
@@ -363,6 +274,23 @@ def get_ancestors_ids(node):
         node = node.parent
     return reversed(word_ids)
 
+def score_node(node):
+    l_term = (((5 + len(get_ancestors_ids(node))) ** alpha) / ((5 + 1) ** alpha))
+    return node.score/l_term
+
+
+'''
+# Scorer class for scoring decoder outputs with length normalization
+class GlobalScorer(object):
+    def __init__(self, alpha):
+        self.alpha = alpha
+
+    # Scoring function for decoder outputs
+    def score(self, node):
+        # Length normalization
+        l_term = (((5 + len(beam.next_ys)) ** self.alpha) / ((5 + 1) ** self.alpha))
+        return log_probs / l_term
+
 
 def print_scores(node_matrix):
     print("\n")
@@ -415,9 +343,6 @@ class Beam(object):
         return self.prev_ks[-1]
 
     def advance(self, word_lk):
-        """
-        `word_lk`- probs of advancing from the last step (K x words)
-        """
         num_words = word_lk.size(1)
 
         # Sum previous scores
@@ -477,15 +402,6 @@ class Beam(object):
             k = self.prev_ks[j][k]
         return hyp[::-1]
 
+'''
 
-# Scorer class for scoring decoder outputs with length normalization
-class GlobalScorer(object):
-    def __init__(self, alpha):
-        self.alpha = alpha
-
-    # Scoring function for decoder outputs
-    def score(self, beam, log_probs):
-        # Length normalization
-        l_term = (((5 + len(beam.next_ys)) ** self.alpha) / ((5 + 1) ** self.alpha))
-        return log_probs / l_term
             
