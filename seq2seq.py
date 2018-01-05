@@ -2,9 +2,11 @@
 Main script
 """
 import sys
+import gc
 import time
 import math
 import random
+import pickle
 
 import numpy as np
 import torch
@@ -13,11 +15,16 @@ from torch.autograd import Variable
 from torch import optim
 from gensim.models.keyedvectors import KeyedVectors
 
+import nltk
+from nltk.corpus import wordnet
+from nltk.stem.wordnet import WordNetLemmatizer
+from nltk.tag import pos_tag
+
 from model.model import EncoderRNN, LuongAttnDecoderRNN
 from model.corpus import PAD_token, UNK_token, SOS_token, EOS_token
 from util.process_text import prepare_data, replace_UNK, remove_UNK
 from util.object_io import save_object, load_object
-from util.text_to_tensor import random_batch
+from util.text_to_tensor import random_batch, get_ordered_batch
 from util.train_helper import train, validate, evaluate_randomly, time_since
 
 # Load config file
@@ -27,7 +34,11 @@ from model.config import *
 with open("./model/config.py", 'r') as fin:
     print(fin.read())
 
-
+print()
+print("####################")
+print("### Corpus Details")
+print("####################")
+print()
 ####################
 ### Load files
 ####################
@@ -70,6 +81,21 @@ else:
     if CREATE_CORPUS_ONLY:
         sys.exit()
 
+
+####################
+### Load embedding
+####################
+def get_wordnet_pos(treebank_tag):
+
+    if treebank_tag.startswith('J'):
+        return wordnet.ADJ
+    elif treebank_tag.startswith('V'):
+        return wordnet.VERB
+    elif treebank_tag.startswith('R'):
+        return wordnet.ADV
+    else:
+        return wordnet.NOUN
+
 # Load word2vec embedding
 embedding = None
 if LOAD_WORD2VEC:
@@ -98,9 +124,54 @@ if LOAD_WORD2VEC:
             print("Saving word2vec embeddings to " + path)
             np.save(path, embedding)
         
-        embedding_size = embedding.shape[1] # Change embedding size to word2vec embedding size
-        print("Finished loading embeddings in {0:.0f} seconds: {1} out of {2} words are using pre-trained embeddings. ".format(time.time(), counter, corpus.n_words))
+        print("Finished loading word2vec embeddings in {0:.0f} seconds: {1} out of {2} words are using pre-trained embeddings. ".format(time.time() - start, counter, corpus.n_words))
+        del word_vectors
 
+    # Load affect embedding dictionary
+    if USE_AFFECT_EMBEDDING:
+        affect_embedding = np.zeros((corpus.n_words, 3)) # Each word has an affect embedding of size 3
+        lmtzr = WordNetLemmatizer()
+        start = time.time()
+        print("Loading affect embeddings from " + AFFECT_EMBEDDING_PATH)
+
+        # Load dictionary of word to vad values 
+        with open(AFFECT_EMBEDDING_PATH, 'rb') as input:
+            word2vad = pickle.load(input)
+
+        # Calculate average vad values
+        vad_sum = np.array([0.0, 0.0, 0.0])
+        for word_id in range(corpus.n_words):
+            word = corpus.index2word[word_id]
+            new_word = lmtzr.lemmatize(word, pos=get_wordnet_pos(pos_tag([word])[0][1]))
+            if new_word in word2vad:
+                vad_sum += np.array(word2vad[new_word])
+        vad_avg = vad_sum/corpus.n_words
+        
+        lemma_corpus_vocab = set()
+        lemma_vad_vocab = set()
+
+        # Assign VAD values to each word in corpus
+        for word_id in range(corpus.n_words):
+            word = corpus.index2word[word_id]
+            new_word = lmtzr.lemmatize(word, pos=get_wordnet_pos(pos_tag([word])[0][1]))
+            lemma_corpus_vocab.add(new_word)
+            
+            if new_word in word2vad:
+                lemma_vad_vocab.add(new_word)
+                affect_embedding[word_id] = np.array(word2vad[new_word])
+            else:
+                affect_embedding[word_id] = vad_avg
+            
+        print("Finished loading affect embeddings in {0:.0f} seconds: {1} out of {2} words are using pre-trained embeddings. ".format(time.time() - start, len(lemma_vad_vocab), len(lemma_corpus_vocab)))
+        # Combine word2vec embedding with affect embedding and multiple weights
+        embedding = np.concatenate((embedding, affect_embedding), axis=1) # (n_words, 303)
+        embedding_size = embedding.shape[1] # Change embedding size to word2vec embedding size
+        affect_coefficients = np.zeros((embedding_size, 1))
+        affect_coefficients[: 300] = 1 - AFFECT_EMBEDDING_STRENGTH
+        affect_coefficients[300: ] = AFFECT_EMBEDDING_STRENGTH
+        embedding = embedding * affect_coefficients.T # Multiply weights to balance word2vec embedding and affect embedding
+        del word2vad
+        
 
 # Train, validation and test split
 print("Spliting into training, validation and test sets")
@@ -112,17 +183,33 @@ pairs_train = pairs[:val_idx]
 pairs_val = pairs[val_idx:test_idx]
 pairs_test = pairs[test_idx:]
 
+# Sort pairs by input sequence length to make samples in a batch have equal lengths
+if ordered_batch:
+    print("Sorting training samples by input sequence length in ascending order...")
+    pairs_train = sorted(pairs_train, key=lambda pair: len(pair[0].split(" ")))
+    current_index = 0
 
+del pairs
+gc.collect()
 ##############################
 ### Train model
 ##############################
+print()
+print("####################")
+print("### Training Details")
+print("####################")
+print()
+
+FILE_NAME = "min-{0}-vocab-{1}-lengths-{2}-{3}-affect-{14}-atten-{4}-embed-{5}-word2vec-{12}-hidden-{6}-layers-{7}-dropout-{8}-epochs-{14}-batch-{9}-teacher-{10}-learn-{11}-id-{13}".format(
+            MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, attn_model, embedding_size, hidden_size, n_layers, dropout, 
+            str(ordered_batch) + "_" + str(batch_size), teacher_forcing_ratio, learning_rate, LOAD_WORD2VEC, model_identifier, n_epochs, 
+            str(USE_AFFECT_EMBEDDING) + "_" + str(AFFECT_EMBEDDING_STRENGTH) + "_" + str(USE_AFFECT_ATTN) + "_" + str(AFFECT_LOSS_STRENGTH))
+
 if LOAD_MODEL:
     print("Loading model...")
-    encoder = torch.load("./saved/{12}/model/encoder-min-{0}-vocab-{1}-lengths-{2}-{3}-atten-{4}-embed-{5}-word2vec-{13}-hidden-{6}-layers-{7}-dropout-{8}-batch-{9}-teacher-{10}-learn-{11}.pt".format(
-            MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, attn_model, embedding_size, hidden_size, n_layers, dropout, batch_size, teacher_forcing_ratio, learning_rate, CORPUS, LOAD_WORD2VEC))
-    decoder = torch.load("./saved/{12}/model/decoder-min-{0}-vocab-{1}-lengths-{2}-{3}-atten-{4}-embed-{5}-word2vec-{13}-hidden-{6}-layers-{7}-dropout-{8}-batch-{9}-teacher-{10}-learn-{11}.pt".format(
-            MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, attn_model, embedding_size, hidden_size, n_layers, dropout, batch_size, teacher_forcing_ratio, learning_rate, CORPUS, LOAD_WORD2VEC))
-
+    encoder = torch.load("./saved/{0}/{1}/{2}-{3}.{4}".format(CORPUS, "model", "encoder", FILE_NAME, "pt"))
+    decoder = torch.load("./saved/{0}/{1}/{2}-{3}.{4}".format(CORPUS, "model", "decoder", FILE_NAME, "pt"))
+    
     print("Start evaluating...")
     while epoch < n_epochs:
         epoch += 1
@@ -130,7 +217,7 @@ if LOAD_MODEL:
 else:
     # Initialize model
     encoder = EncoderRNN(corpus.n_words, embedding_size, hidden_size, n_layers, dropout=dropout, embedding=embedding)
-    decoder = LuongAttnDecoderRNN(attn_model, embedding_size, hidden_size, corpus.n_words, n_layers, dropout=dropout, embedding=embedding)
+    decoder = LuongAttnDecoderRNN(attn_model, embedding_size, hidden_size, corpus.n_words, n_layers, dropout=dropout, embedding=embedding, use_affect=USE_AFFECT_ATTN)
 
     # Initialize optimizers and criterion
     encoder_optimizer = optim.Adam(encoder.parameters(), lr=learning_rate)
@@ -151,28 +238,36 @@ else:
     print("Start training...")
     while epoch < n_epochs:
         epoch += 1
+        
+        # Learning rate annealing
+        # if epoch % 10000 == 0 or epoch % 15000 == 0 or epoch % 18000 == 0:
+        #     learning_rate = learning_rate/2
 
         # Get training batch
         # print("Creating a random batch ...")
-        start = time.time()
-        input_batches, input_lengths, target_batches, target_lengths = random_batch(corpus, pairs_train, batch_size)
+        # start = time.time()
+        if ordered_batch:
+            input_batches, input_lengths, target_batches, target_lengths = get_ordered_batch(corpus, pairs_train, batch_size, current_index)
+            current_index += batch_size
+        else:
+            input_batches, input_lengths, target_batches, target_lengths = random_batch(corpus, pairs_train, batch_size)
         # print("Creating a random batch took {0:.3f} seconds".format(time.time() - start))
 
         # Run the train function
         # print("Training a random batch ...")
-        start = time.time()
+        # start = time.time()
         loss, ec, dc = train(
             input_batches, input_lengths, target_batches, target_lengths,
             encoder, decoder, 
             encoder_optimizer, decoder_optimizer, criterion,
             clip=clip
         )
+        # print(epoch, loss)
         # print("Training a random batch took {0:.3f} seconds".format(time.time() - start))
 
         # Keep track of loss
         print_loss_total += loss
         losses_train_all.append(loss)
-
 
         # Print loss
         if epoch % print_every == 0:
@@ -183,8 +278,12 @@ else:
             losses_train.append(print_loss_avg)
 
             # Validation error
-            input_batches, input_lengths, target_batches, target_lengths = random_batch(corpus, pairs_val, batch_size)
-            error_val = validate(input_batches, input_lengths, target_batches, target_lengths, encoder, decoder)
+            error_val = 0
+            for i in range(n_validations):
+                input_batches, input_lengths, target_batches, target_lengths = random_batch(corpus, pairs_val, batch_size)
+                error_val += validate(input_batches, input_lengths, target_batches, target_lengths, encoder, decoder)
+            
+            error_val = error_val/n_validations
             perplexity_val = math.exp(float(error_val)) if error_val < 300 else float("inf")
             losses_val.append(error_val)
             losses_val_all.append(error_val)
@@ -200,11 +299,9 @@ else:
                     break
             
             # Save losses
-            train_loss_file = "./saved/{12}/loss/train-loss-min-{0}-vocab-{1}-lengths-{2}-{3}-atten-{4}-embed-{5}-word2vec-{13}-hidden-{6}-layers-{7}-dropout-{8}-batch-{9}-teacher-{10}-learn-{11}.txt".format(
-                MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, attn_model, embedding_size, hidden_size, n_layers, dropout, batch_size, teacher_forcing_ratio, learning_rate, CORPUS, LOAD_WORD2VEC)
-            val_loss_file = "./saved/{12}/loss/val-loss-min-{0}-vocab-{1}-lengths-{2}-{3}-atten-{4}-embed-{5}-word2vec-{13}-hidden-{6}-layers-{7}-dropout-{8}-batch-{9}-teacher-{10}-learn-{11}.txt".format(
-                MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, attn_model, embedding_size, hidden_size, n_layers, dropout, batch_size, teacher_forcing_ratio, learning_rate, CORPUS, LOAD_WORD2VEC)
-            
+            train_loss_file = "./saved/{0}/{1}/{2}-{3}.{4}".format(CORPUS, "loss", "train", FILE_NAME, "txt")
+            val_loss_file = "./saved/{0}/{1}/{2}-{3}.{4}".format(CORPUS, "loss", "val", FILE_NAME, "txt")
+
             with open(train_loss_file,'w') as resultFile:
                 for loss in losses_train_all:
                     resultFile.write(str(loss) + '\n')
@@ -218,9 +315,5 @@ else:
             evaluate_randomly(corpus, pairs_test, encoder, decoder, MAX_LENGTH)
 
         if epoch % save_every == 0 and SAVE_MODEL:
-            torch.save(encoder, "./saved/{12}/model/encoder-min-{0}-vocab-{1}-lengths-{2}-{3}-atten-{4}-embed-{5}-word2vec-{13}-hidden-{6}-layers-{7}-dropout-{8}-batch-{9}-teacher-{10}-learn-{11}.pt".format(
-                MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, attn_model, embedding_size, hidden_size, n_layers, dropout, batch_size, teacher_forcing_ratio, learning_rate, CORPUS, LOAD_WORD2VEC))
-            torch.save(decoder, "./saved/{12}/model/decoder-min-{0}-vocab-{1}-lengths-{2}-{3}-atten-{4}-embed-{5}-word2vec-{13}-hidden-{6}-layers-{7}-dropout-{8}-batch-{9}-teacher-{10}-learn-{11}.pt".format(
-                MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, attn_model, embedding_size, hidden_size, n_layers, dropout, batch_size, teacher_forcing_ratio, learning_rate, CORPUS, LOAD_WORD2VEC))
-
-        
+            torch.save(encoder, "./saved/{0}/{1}/{2}-{3}.{4}".format(CORPUS, "model", "encoder", FILE_NAME, "pt"))
+            torch.save(decoder, "./saved/{0}/{1}/{2}-{3}.{4}".format(CORPUS, "model", "decoder", FILE_NAME, "pt"))

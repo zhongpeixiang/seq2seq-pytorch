@@ -14,7 +14,7 @@ from torch.autograd import Variable
 from model.corpus import PAD_token, UNK_token, SOS_token, EOS_token
 from util.text_to_tensor import sentences2indexes
 from util.masked_cross_entropy import masked_cross_entropy
-from model.config import USE_CUDA, GPU_ID, teacher_forcing_ratio, beam_size, alpha
+from model.config import USE_CUDA, GPU_ID, USE_AFFECT_ATTN, AFFECT_LOSS_STRENGTH, teacher_forcing_ratio, beam_size, alpha
 
 
 # Convert seconds into minutes and seconds
@@ -37,6 +37,7 @@ def train(input_batches, input_lengths, target_batches, target_lengths, encoder,
     encoder_optimizer.zero_grad()
     decoder_optimizer.zero_grad()
     loss = 0
+    affect_embedding = None
 
     batch_size = len(input_lengths)
     # print("Batch size: ", batch_size)
@@ -44,13 +45,13 @@ def train(input_batches, input_lengths, target_batches, target_lengths, encoder,
     # print("Target lengths: ", target_lengths)
     # Encoder
     # print("Encoding a random batch ...")
-    start = time.time()
-    encoder_outputs, encoder_hidden = encoder(input_batches, input_lengths, None)
+    # start = time.time()
+    encoder_outputs, encoder_hidden = encoder(input_batches, input_lengths, None) # input_batches: (max_length, batch_size)
     # print("Encoding a random batch took {0:.3f} seconds".format(time.time() - start))
 
     # Decoder
     # print("Decoding a random batch ...")
-    start = time.time()
+    # start = time.time()
     decoder_input = Variable(torch.LongTensor([SOS_token] * batch_size))
     decoder_hidden = encoder_hidden[:decoder.n_layers]
 
@@ -61,19 +62,23 @@ def train(input_batches, input_lengths, target_batches, target_lengths, encoder,
     if USE_CUDA:
         decoder_input = decoder_input.cuda(GPU_ID)
         all_decoder_outputs = all_decoder_outputs.cuda(GPU_ID)
+    if USE_AFFECT_ATTN:
+        affect_embedding = encoder.embedding(input_batches)[:, :, -3:] # Get affect embedding for current input batch, (max_length, batch_size, 3)
+        # print(affect_embedding.size())
+        # print("---------------------")
     
     # Run through decoder one by one
     if random.random() <= teacher_forcing_ratio:
         for t in range(max_target_length):
             # print("Decoding at position {0} ...".format(t))
-            start = time.time()
-            decoder_output, decoder_hidden, decoder_attn = decoder(decoder_input, decoder_hidden, encoder_outputs)
+            # start = time.time()
+            decoder_output, decoder_hidden, decoder_attn = decoder(decoder_input, decoder_hidden, encoder_outputs, affect_embedding)
             # print("Decoding at position {0} took  {1}...".format(t, time.time() - start))
             all_decoder_outputs[t] = decoder_output
             decoder_input = target_batches[t] # Next input is current target, fully teacher forcing
     else:
         for t in range(max_target_length):
-            decoder_output, decoder_hidden, decoder_attn = decoder(decoder_input, decoder_hidden, encoder_outputs)
+            decoder_output, decoder_hidden, decoder_attn = decoder(decoder_input, decoder_hidden, encoder_outputs, affect_embedding)
             all_decoder_outputs[t] = decoder_output
 
             # Next input is the predicted word from previous ietration    
@@ -84,12 +89,32 @@ def train(input_batches, input_lengths, target_batches, target_lengths, encoder,
     # print("Decoding a random batch took {0:.3f} seconds".format(time.time() - start))
     # Loss and optimization
     # print("Loss and optimization ...")
-    start = time.time()
+    # start = time.time()
     loss = masked_cross_entropy(
         all_decoder_outputs.transpose(0, 1).contiguous(), # -> batch x seq
         target_batches.transpose(0, 1).contiguous(), # -> batch x seq
         target_lengths
-    )
+    ) # Variable type, size: [1]
+
+    # print(type(loss))
+    # print(loss.size())
+    # print(loss.data[0])
+    # print("-----------------------")
+    # print(all_decoder_outputs.size())
+    # print(all_decoder_outputs.contiguous().max(2)[1].size())
+    # print(target_batches.size())
+    # Add sentence affect loss
+    if AFFECT_LOSS_STRENGTH != 0:
+        output_affect_embedding = decoder.embedding(all_decoder_outputs.contiguous().max(2)[1])[:, :, -3:]
+        target_affect_embedding = decoder.embedding(target_batches.contiguous())[:, :, -3:]
+        # print(output_affect_embedding)
+        # print(output_affect_embedding.mean(dim=0).mean(dim=0))
+        # print(target_affect_embedding)
+        # print( target_affect_embedding.mean(dim=0).mean(dim=0))
+        affect_loss = torch.dist(output_affect_embedding.mean(dim=0).mean(dim=0), target_affect_embedding.mean(dim=0).mean(dim=0))
+        # print(affect_loss.data[0])
+        loss = (1 - AFFECT_LOSS_STRENGTH)*loss + AFFECT_LOSS_STRENGTH * affect_loss
+    
     loss.backward()
 
     # Clip gradient norms
@@ -106,6 +131,7 @@ def train(input_batches, input_lengths, target_batches, target_lengths, encoder,
 def validate(input_batches, input_lengths, target_batches, target_lengths, encoder, decoder):
     loss = 0
     batch_size = len(input_lengths)
+    affect_embedding = None
     
     # Encoder
     encoder_outputs, encoder_hidden = encoder(input_batches, input_lengths, None)
@@ -120,16 +146,17 @@ def validate(input_batches, input_lengths, target_batches, target_lengths, encod
     if USE_CUDA:
         decoder_input = decoder_input.cuda(GPU_ID)
         all_decoder_outputs = all_decoder_outputs.cuda(GPU_ID)
-    
+    if USE_AFFECT_ATTN:
+        affect_embedding = encoder.embedding(input_batches)[:, :, -3:] # Get affect embedding for current input batch, (max_length, batch_size, 3)
     # Run through decoder one by one
     if random.random() <= teacher_forcing_ratio:
         for t in range(max_target_length):
-            decoder_output, decoder_hidden, decoder_attn = decoder(decoder_input, decoder_hidden, encoder_outputs)
+            decoder_output, decoder_hidden, decoder_attn = decoder(decoder_input, decoder_hidden, encoder_outputs, affect_embedding)
             all_decoder_outputs[t] = decoder_output
             decoder_input = target_batches[t] # Next input is current target, fully teacher forcing
     else:
         for t in range(max_target_length):
-            decoder_output, decoder_hidden, decoder_attn = decoder(decoder_input, decoder_hidden, encoder_outputs)
+            decoder_output, decoder_hidden, decoder_attn = decoder(decoder_input, decoder_hidden, encoder_outputs, affect_embedding)
             all_decoder_outputs[t] = decoder_output
 
             # Next input is the predicted word from previous ietration    
@@ -144,6 +171,12 @@ def validate(input_batches, input_lengths, target_batches, target_lengths, encod
         target_lengths
     )
 
+    if AFFECT_LOSS_STRENGTH != 0:
+        output_affect_embedding = decoder.embedding(all_decoder_outputs.contiguous().max(2)[1])[:, :, -3:]
+        target_affect_embedding = decoder.embedding(target_batches.contiguous())[:, :, -3:]
+        affect_loss = torch.dist(output_affect_embedding.mean(dim=0).mean(dim=0), target_affect_embedding.mean(dim=0).mean(dim=0))
+        loss = (1 - AFFECT_LOSS_STRENGTH)*loss + AFFECT_LOSS_STRENGTH * affect_loss
+
     return loss.data[0]
 
 # Evaluate single word and produce sentence output
@@ -152,6 +185,7 @@ def evaluate(corpus, encoder, decoder, input_seq, max_length):
     input_lengths = [len(input_seq)]
     input_seqs = [sentences2indexes(corpus, input_seq)]
     input_batches = Variable(torch.LongTensor(input_seqs), volatile=True).transpose(0, 1)
+    affect_embedding = None
 
     if USE_CUDA:
         input_batches = input_batches.cuda(GPU_ID)
@@ -179,14 +213,20 @@ def evaluate(corpus, encoder, decoder, input_seq, max_length):
     node_list = []
     node_matrix = [[None] * beam_size for _ in range(beam_size)]
     finished_nodes = []
+
+    # Affect embedding
+    if USE_AFFECT_ATTN:
+        affect_embedding = encoder.embedding(input_batches)[:, :, -3:] # Get affect embedding for current input batch, (max_length, batch_size, 3)
+
     for idx in range(max_length):
         decoder_output, decoder_hidden, decoder_attention = decoder(
-            decoder_input, decoder_hidden, encoder_outputs
+            decoder_input, decoder_hidden, encoder_outputs, affect_embedding
         )
         # decoder_attentions[idx,:decoder_attention.size(2)] += decoder_attention.squeeze(0).squeeze(0).cpu().data
 
         # Choose top word from output
         topv, topi = decoder_output.data.topk(beam_size, 1, largest=True, sorted=True) # (beam_size, beam_size) or (1, beam_size) for the first time
+        topv = torch.log(topv) # take log of softmax probabilities
         if first:
             decoder_input = decoder_input.repeat(beam_size)
             decoder_hidden = decoder_hidden.repeat(1, beam_size, 1)
@@ -200,13 +240,20 @@ def evaluate(corpus, encoder, decoder, input_seq, max_length):
             # Build a matrix of nodes, size: (beam_size, beam_size)
             for i in range(beam_size):
                 for j in range(beam_size):
-                    node_matrix[i][j] = Node(node_list[i].score * topv[i][j], topi[i][j])
+                    ancestors = get_ancestors_ids(node_list[i])
+                    beam_length = 0
+                    for e in ancestors:
+                        beam_length += 1
+                    length_term_before = node_length_term(beam_length)
+                    length_term_after = node_length_term(beam_length + 1)
+
+                    # Added  length penalty
+                    node_matrix[i][j] = Node((node_list[i].score + topv[i][j]) * length_term_before/length_term_after, topi[i][j])
                     node_matrix[i][j].add_parent(node_list[i])
-                    # topv[i][j] = node_list[i].score * topv[i][j] # Update topv scores
 
             # Select top nodes
             node_list.clear()
-            flattened_list = reduce(lambda x,y :x+y ,node_matrix)
+            flattened_list = reduce(lambda x,y :x+y , node_matrix)
             sorted_flattened_list = sorted(flattened_list, key=lambda node: node.score, reverse=True)
             for node in sorted_flattened_list:
                 if node.word_id != EOS_token:
@@ -274,9 +321,9 @@ def get_ancestors_ids(node):
         node = node.parent
     return reversed(word_ids)
 
-def score_node(node):
-    l_term = (((5 + len(get_ancestors_ids(node))) ** alpha) / ((5 + 1) ** alpha))
-    return node.score/l_term
+def node_length_term(node_length):
+    l_term = (((5 + node_length) ** alpha) / ((5 + 1) ** alpha))
+    return l_term
 
 
 '''
