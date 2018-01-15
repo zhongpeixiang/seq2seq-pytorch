@@ -5,11 +5,14 @@ import time
 import math
 import random
 from functools import reduce
+import string
 
 import numpy as np
+from scipy.spatial.distance import cosine
 import bottleneck as bn
 import torch
 from torch.autograd import Variable
+from nltk import bigrams
 
 from model.corpus import PAD_token, UNK_token, SOS_token, EOS_token
 from util.text_to_tensor import sentences2indexes
@@ -95,7 +98,7 @@ def train(input_batches, input_lengths, target_batches, target_lengths, encoder,
         target_batches.transpose(0, 1).contiguous(), # -> batch x seq
         target_lengths
     ) # Variable type, size: [1]
-
+    perplexity_loss = loss.data[0]
     # print(type(loss))
     # print(loss.size())
     # print(loss.data[0])
@@ -125,10 +128,60 @@ def train(input_batches, input_lengths, target_batches, target_lengths, encoder,
     decoder_optimizer.step()
     # print("Loss and optimization took {0:.3f} seconds".format(time.time() - start))
 
-    return loss.data[0], ec, dc
+    return perplexity_loss, ec, dc # return perplexity loss
+
+
+# Calculate greedy similarity between two sentences
+def greedy_similarity(sent1, sent2):
+    greedy_score = 0
+    for word_1 in range(sent1.size(0)):
+        max_score = 0
+        for word_2 in range(sent2.size(0)):
+            score = 1 - cosine(sent1[word_1].numpy(), sent2[word_2].numpy())
+            if score > max_score:
+                max_score = score
+        greedy_score += max_score
+    greedy_score = greedy_score/sent1.size(0)
+    return greedy_score
+
+
+# Calculate embedding similaries for three modes: greedy matching, average, and extrema
+def embed_similarity(output_embedding, target_embedding):
+    # output_embedding: (batch_size, seq_len, embedding_size)
+    
+    # Calculate greedy similarity
+    greedy_score = 0
+    for idx in range(output_embedding.size(0)):
+        output_sent_embed = output_embedding[idx]
+        target_sent_embed = target_embedding[idx]
+
+        greedy_score += 0.5 * (greedy_similarity(output_sent_embed, target_sent_embed) + greedy_similarity(target_sent_embed, output_sent_embed))
+    greedy_score = greedy_score/output_embedding.size(0)
+    
+    # Calculate average similarity
+    avg_score = 0
+    for idx in range(output_embedding.size(0)):
+        output_sent_embed = output_embedding[idx]
+        target_sent_embed = target_embedding[idx]
+
+        avg_score += 1 - cosine(output_sent_embed.mean(dim=0).numpy(), target_sent_embed.mean(dim=0).numpy())
+    avg_score = avg_score/output_embedding.size(0)
+
+    # Calculate emtrema similarity
+    extrema_score = 0
+    for idx in range(output_embedding.size(0)):
+        output_sent_embed = output_embedding[idx]
+        target_sent_embed = target_embedding[idx]
+
+        extrema_score += 1 - cosine(output_sent_embed.max(0)[0].numpy(), target_sent_embed.max(0)[0].numpy())
+    extrema_score = extrema_score/output_embedding.size(0)
+
+    return greedy_score, avg_score, extrema_score
+
+
 
 # Validate model using validation set
-def validate(input_batches, input_lengths, target_batches, target_lengths, encoder, decoder):
+def validate(corpus, word_embedding, input_batches, input_lengths, target_batches, target_lengths, encoder, decoder):
     loss = 0
     batch_size = len(input_lengths)
     affect_embedding = None
@@ -170,6 +223,7 @@ def validate(input_batches, input_lengths, target_batches, target_lengths, encod
         target_batches.transpose(0, 1).contiguous(), # -> batch x seq
         target_lengths
     )
+    perplexity_loss = loss.data[0]
 
     if AFFECT_LOSS_STRENGTH != 0:
         output_affect_embedding = decoder.embedding(all_decoder_outputs.contiguous().max(2)[1])[:, :, -3:]
@@ -177,7 +231,27 @@ def validate(input_batches, input_lengths, target_batches, target_lengths, encod
         affect_loss = torch.dist(output_affect_embedding.mean(dim=0).mean(dim=0), target_affect_embedding.mean(dim=0).mean(dim=0))
         loss = (1 - AFFECT_LOSS_STRENGTH)*loss + AFFECT_LOSS_STRENGTH * affect_loss
 
-    return loss.data[0]
+    # Distinct-1 and distinct-2
+    batch_tokens = all_decoder_outputs.transpose(0, 1).contiguous().max(2)[1].data # batch_tokens: (batch_size, seq_len)
+    distinct1 = 0
+    distinct2 = 0
+    for idx in range(batch_tokens.size(0)):
+        tokens = [token for token in batch_tokens[idx] if corpus.index2word[token] not in string.punctuation]
+        if len(tokens) != 0:
+            distinct1 += len(set(tokens))/len(tokens)
+        bi_grams = [item for item in bigrams(tokens)]
+        if len(bi_grams) != 0:
+            distinct2 += len(set(bi_grams))/len(bi_grams)
+    distinct1 = distinct1/batch_tokens.size(0)
+    distinct2 = distinct2/batch_tokens.size(0)
+
+    # Embedding Metrics
+    output_embedding = word_embedding(all_decoder_outputs.transpose(0, 1).contiguous().max(2)[1]) # output_embedding: (batch_size, seq, embedding_size)
+    target_embedding = word_embedding(target_batches.transpose(0, 1).contiguous()) # target_embedding: (batch_size, seq, embedding_size)
+
+    embed_greedy, embed_avg, embed_extrema = embed_similarity(output_embedding.cpu().data, target_embedding.cpu().data)
+
+    return perplexity_loss, distinct1, distinct2, embed_greedy, embed_avg, embed_extrema
 
 # Evaluate single word and produce sentence output
 def evaluate(corpus, encoder, decoder, input_seq, max_length):

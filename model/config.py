@@ -7,10 +7,10 @@ All configuration parameters are here
 ####################
 # GPU and IO
 USE_CUDA = True # If True, use GPU
-GPU_ID = 3 # GPU device id
+GPU_ID = 1 # GPU device id
 SAVE_CORPUS = False # Save preprocessed corpus data (corpus, pairs) into pickle file for easy reload
 LOAD_CORPUS = True # Load preprocessed corpus, pairs data
-SAVE_MODEL = True # Save PyTorch encoder, decoder model
+SAVE_MODEL = False # Save PyTorch encoder, decoder model
 LOAD_MODEL = False # Load PyTorch encoder, decoder model
 
 # Filter words
@@ -35,7 +35,7 @@ LOAD_NUMPY_WORD2VEC = True # If True, load word2vec embedding from numpy matrix
 USE_AFFECT_EMBEDDING = True # If True, use affect wrod embedding
 AFFECT_EMBEDDING_PATH = "./data/vad_words/word2vad.pkl" # Path of affect embedding dictionary for 13,915 words
 AFFECT_EMBEDDING_STRENGTH = 0.01 # Weights for word2vec and affect embedding, usually in [0.01, 0.05]
-USE_AFFECT_ATTN = True # If True, use affective attention mechanism
+USE_AFFECT_ATTN = False # If True, use affective attention mechanism
 AFFECT_LOSS_STRENGTH = 0.1 # Weight for affective loss between output sentence and target sentence
 
 
@@ -46,10 +46,10 @@ hidden_size = 1024 # Hidden layer size
 n_layers = 2 # Number of GRU layers
 dropout = 0.1 # Dropout strength
 batch_size = 64 # Batch size
-ordered_batch = True # If True, sort training samples by input sequence length and get batch that contains samples of equal input sequence length
+ordered_batch = False # If True, sort training samples by input sequence length and get batch that contains samples of equal input sequence length
 val_ratio = 0.2 # Ratio of validation set to total data set
 test_ratio = 0.1 # Ratio of test set to total data set
-model_identifier = "ex7"
+model_identifier = "eval"
 
 # Training configuration
 clip = 5 # Gradient clipping to avoid gradient exploding problem
@@ -62,6 +62,6 @@ n_epochs = 80000 # Number of training cycles, one cycle trains one batch of samp
 epoch = 0 # Starting epoch at 0
 early_stopping = False # If True, the training stops when consecutive validation errors are increasing
 print_every = 200 # Print training summary every a few epochs
-n_validations = 20 # Number of validation batches per validation
-evaluate_every = 100000 # Evaluate model using evaluation dataset every a few epcohs
+n_validations = 40 # Number of validation batches per validation
+evaluate_every = 200 # Evaluate model using evaluation dataset every a few epcohs
 save_every = 2000 # Save encoder and decoder every a few epcohs

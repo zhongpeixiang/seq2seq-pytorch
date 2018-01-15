@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 from torch.autograd import Variable
 import torch.nn.functional as F
+import torch.nn.init as weight_init
 
 from model.config import USE_CUDA, GPU_ID, LOAD_WORD2VEC
 
@@ -179,7 +180,7 @@ class LuongAttnDecoderRNN(nn.Module):
         concat_output = F.tanh(self.concat(concat_input))
 
         # Finally predict next token (Luong eq. 6, without softmax)
-        output = self.out(concat_output)
+        output = self.out(concat_output) # output: (batch_size, output_size)
 
         # Return final output, hidden state, and attention weights (for visualization)
         return output, hidden, attn_weights
@@ -231,27 +232,188 @@ class BahdanauAttnDecoderRNN(nn.Module):
 
 # RNN model to predict sentiment (VAD) of sentences
 class SentimentRNN(nn.Module):
-    def __init__(self, input_size, embedding_size, hidden_size, output_size, n_layers, dropout=0.1, embedding=None):
+    def __init__(self, model, input_size, embedding_size, hidden_size, output_size, n_layers, dropout, embedding, freeze_embed, output_projection, use_attention):
         super(SentimentRNN, self).__init__()
 
+        self.model = model
         self.input_size = input_size
         self.embedding_size = embedding_size
         self.hidden_size = hidden_size
         self.output_size = output_size
         self.n_layers = n_layers
         self.dropout = dropout
+        self.freeze_embed = freeze_embed
+        self.output_projection = output_projection
+        self.use_attention = use_attention
+        if use_attention == "self-attention":
+            self.attn_size = 200
+            self.attn_matrix = nn.Parameter(torch.Tensor(np.random.uniform(-0.01, 0.01, (self.attn_size, 2 * hidden_size)))) # (d, 2 * hidden_size)
+            self.attn_vector = nn.Parameter(torch.Tensor(np.random.uniform(-0.01, 0.01, (self.attn_size)))) # (d, )
+        elif use_attention == "vec-attention":
+            self.attn_vector = nn.Parameter(torch.Tensor(np.random.uniform(-0.01, 0.01, (2 * hidden_size)))) # (2 * hidden_size, )
 
         self.embedding = nn.Embedding(input_size, embedding_size)
         self.embedding.weight = nn.Parameter(torch.Tensor(np.random.uniform(-0.1, 0.1, (input_size, embedding_size))))
         self.embedding.weight.data.copy_(torch.from_numpy(embedding))
+        if freeze_embed:
+            self.embedding.weight.requires_grad = False
         
-        self.gru = nn.GRU(embedding_size, hidden_size, n_layers, dropout=dropout, bidirectional=True)
-        self.out = nn.Linear(hidden_size, output_size)
+        if model == "rnn":
+            self.rnn = nn.RNN(embedding_size, hidden_size, n_layers, dropout=dropout[1], bidirectional=True)
+        elif model == "gru":
+            self.rnn = nn.GRU(embedding_size, hidden_size, n_layers, dropout=dropout[1], bidirectional=True)
+        elif model == "lstm":
+            self.rnn = nn.LSTM(embedding_size, hidden_size, n_layers, dropout=dropout[1], bidirectional=True)
+        for name, param in self.rnn.named_parameters(): 
+            weight_init.uniform(param, -0.01, 0.01)
+        
+        
+        if output_projection:
+            self.linear = nn.Linear(hidden_size * 2, 256)
+            self.relu = nn.ReLU()
+            self.out = nn.Linear(256, output_size)
+        else:
+            self.out = nn.Linear(hidden_size * 2, output_size)
 
-    def forward(self, input_seqs, input_lengths, hidden=None):
+    def forward(self, input_seqs, input_lengths):
+        batch_size = input_seqs.size(1)
         embedded = self.embedding(input_seqs)
+        embedded = F.dropout(embedded, self.dropout[0], training=self.training) # Dropout for embedding
         packed = torch.nn.utils.rnn.pack_padded_sequence(embedded, input_lengths)
-        outputs, hidden = self.gru(packed, hidden) # hidden: (n_layers * n_directions, batch, hidden_size)
-        hidden = 0.5 * (hidden[self.n_layers - 1] + hidden[-1]) # Average over forward and backward hidden state at top layer
-        out = self.out(hidden) # hidden: (batch, hidden_size), out: (batch, output_size)
+        hidden = self.init_hidden(batch_size)
+        if self.model == "lstm":
+            outputs, hidden = self.rnn(packed, hidden) # outputs: (seq_len, batch, hidden_size * num_directions), hidden: (n_layers * n_directions, batch, hidden_size)
+            hidden = hidden[0] # Extract hidden states, leave out cell state
+        elif self.model == "rnn" or self.model == "gru":
+            outputs, hidden = self.rnn(packed, hidden)
+        outputs, output_lengths = torch.nn.utils.rnn.pad_packed_sequence(outputs)
+        # hidden = 0.5 * (hidden[self.n_layers - 1] + hidden[-1]) # Average over forward and backward hidden state at top layer
+        hidden = torch.cat((hidden[self.n_layers - 1], hidden[-1]), 1) # Concatenate forward and backward hidden state at top layer
+        if self.use_attention:
+            hidden = self.attention(self.use_attention, outputs) # (batch, 2 * hidden_size)
+        hidden = F.dropout(hidden, self.dropout[2], training=self.training) # Dropout for hidden state
+        
+        # Output
+        if self.output_projection:
+            hidden = self.linear(hidden)
+            relu = self.relu(hidden)
+            out = self.out(relu)
+        else:
+            out = self.out(hidden)
         return out
+    
+    def attention(self, attention_model, hidden_states):
+        # Transform to size: (batch, seq_len, hidden_size * num_directions)
+        hidden_states = hidden_states.view(hidden_states.size(1), hidden_states.size(0), hidden_states.size(2))
+        if attention_model == "self-attention":
+            nonlinear_states = F.tanh(hidden_states.matmul(self.attn_matrix.transpose(0, 1))) # (batch, seq_len, d)
+            attn_weights = F.softmax(nonlinear_states.matmul(self.attn_vector)) # (batch, seq_len)
+        elif attention_model == "vec-attention":
+            nonlinear_states = F.tanh(hidden_states.matmul(self.attn_vector)) # (batch, seq_len)
+            attn_weights = F.softmax(nonlinear_states) # (batch, seq_len)
+        attn_weights = attn_weights.view(attn_weights.size(0), 1, attn_weights.size(1)) # (batch, 1, seq_len)
+        weighted_hidden = attn_weights.bmm(hidden_states)# (batch, 1, seq_len), (batch, seq_len, 2*hidden_size) => (batch, 1, 2*hidden_size)
+        return weighted_hidden
+
+
+    def init_hidden(self, batch_size):
+        weight = next(self.parameters()).data
+        if self.model == 'lstm':
+            return (Variable(weight.new(2 * self.n_layers, batch_size, self.hidden_size).zero_()),
+                    Variable(weight.new(2 * self.n_layers, batch_size, self.hidden_size).zero_()))
+        else:
+            return Variable(weight.new(2 * self.n_layers, batch_size, self.hidden_size).zero_())
+
+# RNN model to predict sentiment (VAD) of sentences
+class KaggleSentimentRNN(nn.Module):
+    def __init__(self, model, input_size, embedding_size, hidden_size, output_size, n_layers, dropout, embedding, freeze_embed, output_projection, use_attention):
+        super(KaggleSentimentRNN, self).__init__()
+
+        self.model = model
+        self.input_size = input_size
+        self.embedding_size = embedding_size
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+        self.n_layers = n_layers
+        self.dropout = dropout
+        self.freeze_embed = freeze_embed
+        self.output_projection = output_projection
+        self.use_attention = use_attention
+        if use_attention == "self-attention":
+            self.attn_size = 200
+            self.attn_matrix = nn.Parameter(torch.Tensor(np.random.uniform(-0.01, 0.01, (self.attn_size, 2 * hidden_size)))) # (d, 2 * hidden_size)
+            self.attn_vector = nn.Parameter(torch.Tensor(np.random.uniform(-0.01, 0.01, (self.attn_size)))) # (d, )
+        elif use_attention == "vec-attention":
+            self.attn_vector = nn.Parameter(torch.Tensor(np.random.uniform(-0.01, 0.01, (2 * hidden_size)))) # (2 * hidden_size, )
+
+        self.embedding = nn.Embedding(input_size, embedding_size)
+        self.embedding.weight = nn.Parameter(torch.Tensor(np.random.uniform(-0.1, 0.1, (input_size, embedding_size))))
+        self.embedding.weight.data.copy_(torch.from_numpy(embedding))
+        if freeze_embed:
+            self.embedding.weight.requires_grad = False
+        
+        if model == "rnn":
+            self.rnn = nn.RNN(embedding_size, hidden_size, n_layers, dropout=dropout[1], bidirectional=True)
+        elif model == "gru":
+            self.rnn = nn.GRU(embedding_size, hidden_size, n_layers, dropout=dropout[1], bidirectional=True)
+        elif model == "lstm":
+            self.rnn = nn.LSTM(embedding_size, hidden_size, n_layers, dropout=dropout[1], bidirectional=True)
+        for name, param in self.rnn.named_parameters(): 
+            weight_init.uniform(param, -0.01, 0.01)
+        
+        
+        if output_projection:
+            self.linear = nn.Linear(hidden_size * 2, 256)
+            self.relu = nn.ReLU()
+            self.out = nn.Linear(256, output_size)
+        else:
+            self.out = nn.Linear(hidden_size * 2, output_size)
+
+    def forward(self, input_seqs, input_lengths):
+        batch_size = input_seqs.size(1)
+        embedded = self.embedding(input_seqs)
+        embedded = F.dropout(embedded, self.dropout[0], training=self.training) # Dropout for embedding
+        packed = torch.nn.utils.rnn.pack_padded_sequence(embedded, input_lengths)
+        hidden = self.init_hidden(batch_size)
+        if self.model == "lstm":
+            outputs, hidden = self.rnn(packed, hidden) # outputs: (seq_len, batch, hidden_size * num_directions), hidden: (n_layers * n_directions, batch, hidden_size)
+            hidden = hidden[0] # Extract hidden states, leave out cell state
+        elif self.model == "rnn" or self.model == "gru":
+            outputs, hidden = self.rnn(packed, hidden)
+        outputs, output_lengths = torch.nn.utils.rnn.pad_packed_sequence(outputs)
+        # hidden = 0.5 * (hidden[self.n_layers - 1] + hidden[-1]) # Average over forward and backward hidden state at top layer
+        hidden = torch.cat((hidden[self.n_layers - 1], hidden[-1]), 1) # Concatenate forward and backward hidden state at top layer
+        if self.use_attention:
+            hidden = self.attention(self.use_attention, outputs) # (batch, 2 * hidden_size)
+        hidden = F.dropout(hidden, self.dropout[2], training=self.training) # Dropout for hidden state
+        
+        # Output
+        if self.output_projection:
+            hidden = self.linear(hidden)
+            relu = self.relu(hidden)
+            out = self.out(relu)
+        else:
+            out = self.out(hidden)
+        return out.view(batch_size, self.output_size)
+    
+    def attention(self, attention_model, hidden_states):
+        # Transform to size: (batch, seq_len, hidden_size * num_directions)
+        hidden_states = hidden_states.view(hidden_states.size(1), hidden_states.size(0), hidden_states.size(2))
+        if attention_model == "self-attention":
+            nonlinear_states = F.tanh(hidden_states.matmul(self.attn_matrix.transpose(0, 1))) # (batch, seq_len, d)
+            attn_weights = F.softmax(nonlinear_states.matmul(self.attn_vector)) # (batch, seq_len)
+        elif attention_model == "vec-attention":
+            nonlinear_states = F.tanh(hidden_states.matmul(self.attn_vector)) # (batch, seq_len)
+            attn_weights = F.softmax(nonlinear_states) # (batch, seq_len)
+        attn_weights = attn_weights.view(attn_weights.size(0), 1, attn_weights.size(1)) # (batch, 1, seq_len)
+        weighted_hidden = attn_weights.bmm(hidden_states)# (batch, 1, seq_len), (batch, seq_len, 2*hidden_size) => (batch, 1, 2*hidden_size)
+        return weighted_hidden
+
+
+    def init_hidden(self, batch_size):
+        weight = next(self.parameters()).data
+        if self.model == 'lstm':
+            return (Variable(weight.new(2 * self.n_layers, batch_size, self.hidden_size).zero_()),
+                    Variable(weight.new(2 * self.n_layers, batch_size, self.hidden_size).zero_()))
+        else:
+            return Variable(weight.new(2 * self.n_layers, batch_size, self.hidden_size).zero_())

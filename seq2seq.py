@@ -127,6 +127,11 @@ if LOAD_WORD2VEC:
         print("Finished loading word2vec embeddings in {0:.0f} seconds: {1} out of {2} words are using pre-trained embeddings. ".format(time.time() - start, counter, corpus.n_words))
         del word_vectors
 
+    # Keep a copy of original word2vec embedding
+    word_embedding = nn.Embedding(corpus.n_words, 300)
+    word_embedding.weight.data.copy_(torch.from_numpy(embedding))
+    word_embedding = word_embedding.cuda(GPU_ID)
+
     # Load affect embedding dictionary
     if USE_AFFECT_EMBEDDING:
         affect_embedding = np.zeros((corpus.n_words, 3)) # Each word has an affect embedding of size 3
@@ -277,19 +282,37 @@ else:
             print_loss_total = 0
             losses_train.append(print_loss_avg)
 
-            # Validation error
+            # Validation metrics
             error_val = 0
+            distinct1 = 0
+            distinct2 = 0
+            embed_greedy = 0
+            embed_avg = 0
+            embed_extrema = 0
             for i in range(n_validations):
                 input_batches, input_lengths, target_batches, target_lengths = random_batch(corpus, pairs_val, batch_size)
-                error_val += validate(input_batches, input_lengths, target_batches, target_lengths, encoder, decoder)
+                eval_metrics = validate(corpus, word_embedding, input_batches, input_lengths, target_batches, target_lengths, encoder, decoder)
+                # print(eval_metrics)
+                error_val += eval_metrics[0]
+                distinct1 += eval_metrics[1]
+                distinct2 += eval_metrics[2]
+                embed_greedy += eval_metrics[3]
+                embed_avg += eval_metrics[4]
+                embed_extrema += eval_metrics[5]
             
             error_val = error_val/n_validations
+            distinct1 = distinct1/n_validations
+            distinct2 = distinct2/n_validations
+            embed_greedy = embed_greedy/n_validations
+            embed_avg = embed_avg/n_validations
+            embed_extrema = embed_extrema/n_validations
             perplexity_val = math.exp(float(error_val)) if error_val < 300 else float("inf")
             losses_val.append(error_val)
             losses_val_all.append(error_val)
 
-            print_summary = "{0} (Epoch: {1}, Progress: {2:.2f}%) Loss: {3:.2f}, Perplexity: {4:.2f}. Validation Loss: {5:.2f}, Validation Perplexity: {6:.2f}".format(
-                time_since(start, epoch / n_epochs), epoch, epoch / n_epochs * 100, print_loss_avg, perplexity, error_val, perplexity_val)
+            print_summary = "{0} (Epoch: {1}, Progress: {2:.2f}%) Loss: {3:.2f}, Perplexity: {4:.2f}. Validation Loss: {5:.2f}, Validation Perplexity: {6:.2f}, \
+            Distinct-1: {7:.3f}, Distinct-2: {8:.3f}, Embed-greedy: {9:.3f}, Embed-avg: {10:.3f}, Embed-extrema: {11:.3f}".format(
+                time_since(start, epoch / n_epochs), epoch, epoch / n_epochs * 100, print_loss_avg, perplexity, error_val, perplexity_val, distinct1, distinct2, embed_greedy, embed_avg, embed_extrema)
             print(print_summary)
 
             # Early stopping

@@ -8,6 +8,7 @@ import string
 import argparse
 
 import numpy as np
+
 import torch
 import torch.nn as nn
 from torch.autograd import Variable
@@ -21,7 +22,7 @@ from nltk.stem.wordnet import WordNetLemmatizer
 from nltk.tag import pos_tag
 
 from model.config import WORD2VEC_PATH, AFFECT_EMBEDDING_PATH, AFFECT_EMBEDDING_STRENGTH
-from model.model import SentimentRNN
+from model.model import KaggleSentimentRNN
 from util.process_text import normalize_string
 from util.text_to_tensor import pad_seq
 from util.train_helper import time_since
@@ -40,8 +41,9 @@ globalArgs.add_argument('--LOAD_NUMPY_WORD2VEC', action='store_true', help='If t
 
 # Dataset options
 datasetArgs = parser.add_argument_group('Dataset options')
-datasetArgs.add_argument('--CORPUS', type=str, default='emobank', help='name of the corpus used')
-datasetArgs.add_argument('--MIN_LENGTH', type=int, default=1, help='minimum length of the sentence, define number of minimum step of the RNN')
+datasetArgs.add_argument('--CORPUS', type=str, default='kaggle_sentiment', help='name of the corpus used')
+datasetArgs.add_argument('--KEEP_PUNCTUATIONS', action='store_true', help='If true, keep punctuations in training data')
+datasetArgs.add_argument('--MIN_LENGTH', type=int, default=0, help='minimum length of the sentence, define number of minimum step of the RNN')
 datasetArgs.add_argument('--MAX_LENGTH', type=int, default=20, help='maximum length of the sentence, define number of maximum step of the RNN')
 
 # Network options
@@ -76,25 +78,19 @@ SEED = 412
 AFFECT_EMBEDDING_STRENGTH = args.AFFECT_EMBEDDING_STRENGTH
 TEST_MODE = False
 CORPUS = args.CORPUS
-if CORPUS == "emobank":
-    SENTENCE_FILE_PATH = './data/vad_sents/sent2vad.pkl'
-    output_size = 3
-elif CORPUS == "fb_posts":
-    SENTENCE_FILE_PATH = './data/vad_posts/post2vad.pkl'
-    output_size = 2
 
 SAVE_MODEL = args.SAVE_MODEL
 LOAD_NUMPY_WORD2VEC = args.LOAD_NUMPY_WORD2VEC
 MIN_LENGTH = args.MIN_LENGTH
 MAX_LENGTH = args.MAX_LENGTH
-KEEP_PUNCTUATIONS = True
+KEEP_PUNCTUATIONS = args.KEEP_PUNCTUATIONS
 val_ratio = 0.2
-test_ratio = 0.1
 
 rnn_model = args.rnn_model
 attention = args.attention
 embedding_size = 300
 hidden_size = args.hidden_size
+output_size = 5
 n_layers = args.n_layers
 output_projection = args.output_projection
 dropout = args.dropout
@@ -129,11 +125,15 @@ FILE_NAME = "lengths-{0}-{1}-hidden-{2}-layers-{3}-dropout-{4}-epochs-{5}-batch-
             batch_size, learning_rate, model_identifier)
 
 # Load sentence data
-with open(SENTENCE_FILE_PATH, 'rb') as input:
-    sent2vad = pickle.load(input)
+with open("./data/kaggle_sentiment/train_list.pkl", 'rb') as input:
+    train_list = pickle.load(input)
+
+with open("./data/kaggle_sentiment/test_list.pkl", 'rb') as input:
+    test_list = pickle.load(input)
 
 inputs = [] # A list of sentences, each sentence has a list of words
 targets = [] # A list of VAD tuples, each VAD tuple corresponds to one sentence
+tests = []
 word2index = {"PAD": 0}
 index2word = {0: "PAD"}
 word2count = {"PAD": 0}
@@ -142,12 +142,13 @@ n_words = 1
 # Build corpus dictionaries
 print("Building corpus dictionaries...")
 start = time.time()
-for sent in sent2vad:
+for t in train_list:
+    phrase = t[1]
     sent_words = []
-    sent_vad = list(sent2vad[sent][output_size:]) # Use reader perspective
+    sentiment = t[2] # Use reader perspective
 
-    sent = normalize_string(sent.lower())
-    words = sent.split(" ")
+    phrase = normalize_string(phrase.lower())
+    words = phrase.split(" ")
     # Remove punctuations
     if not KEEP_PUNCTUATIONS:
         words = [w for w in words if w not in string.punctuation]
@@ -163,10 +164,31 @@ for sent in sent2vad:
                 index2word[n_words] = word
                 n_words += 1
         inputs.append(sent_words)
-        targets.append(sent_vad)
+        targets.append(sentiment)
+
+for t in test_list:
+    phrase = t[1]
+    sent_words = []
+
+    phrase = normalize_string(phrase.lower())
+    words = phrase.split(" ")
+    # Remove punctuations
+    if not KEEP_PUNCTUATIONS:
+        words = [w for w in words if w not in string.punctuation]
+    # Filter out very short and very long sentences
+    for word in words:
+        sent_words.append(word)
+        if word in word2index:
+            word2count[word] += 1
+        else:
+            word2index[word] = n_words
+            word2count[word] = 1
+            index2word[n_words] = word
+            n_words += 1
+    tests.append(sent_words)
 
 print("Indexed {0} words in {1:.2f} seconds".format(n_words, time.time() - start))
-print("Selected {0} out of {1} sentences".format(len(inputs), len(sent2vad)))
+print("Selected {0} out of {1} sentences".format(len(inputs), len(train_list)))
 
 sample_index = random.randint(0, len(inputs))
 print("Sample input word: ", inputs[sample_index])
@@ -176,7 +198,9 @@ for i in range(len(inputs)):
     inputs[i] = [word2index[word] for word in inputs[i]]
 
 print("Sample input word indexes: ", inputs[sample_index])
-print("Sample target VAD values: ", targets[sample_index])
+print("Sample target sentiment value: ", targets[sample_index])
+
+print("Test dataset length: ", len(tests))
 
 
 ####################
@@ -292,7 +316,7 @@ def random_batch(inputs, targets, batch_size):
 
     # Turn padded arrays into (batch_size x max_length) tensors, transpose into (max_length, batch_size)
     input_tensor = Variable(torch.LongTensor(input_padded)).transpose(0, 1)
-    target_tensor = Variable(torch.FloatTensor(target_vad))
+    target_tensor = Variable(torch.LongTensor(target_vad))
 
     if USE_CUDA:
         input_tensor = input_tensor.cuda(GPU_ID)
@@ -300,23 +324,28 @@ def random_batch(inputs, targets, batch_size):
     
     return input_tensor, input_lengths, target_tensor # (T, B), (B, ), (B, 3)
 
+def accuracy(output, target):
+    # output: (batch_size, output_size)
+    # target: (batch_size, )
+    idx_max = output.max(1)[1]
+    accuracy_ = (torch.sum(idx_max == target)).type(torch.FloatTensor)/target.size(0)
+    return accuracy_.data[0]
 
 # batch = random_batch(inputs, targets, batch_size)
 # print(batch)
+# sys.exit()
 
 # Train, validate and test split
-print("Spliting into training, validation and test sets")
+print("Spliting into training, validation sets")
 random.seed(SEED)
 
 combined = list(zip(inputs, targets))
 random.shuffle(combined)
 inputs[:], targets[:] = zip(*combined)
 
-val_idx = int(len(inputs) * (1 - val_ratio - test_ratio))
-test_idx = int(len(inputs) * (1 - test_ratio))
+val_idx = int(len(inputs) * (1 - val_ratio))
 inputs_train, targets_train = inputs[:val_idx], targets[:val_idx]
-inputs_val, targets_val = inputs[val_idx:test_idx], targets[val_idx:test_idx]
-inputs_test, targets_test = inputs[test_idx:], targets[test_idx:]
+inputs_val, targets_val = inputs[val_idx:], targets[val_idx:]
 
 ####################
 ### Train model
@@ -339,7 +368,7 @@ if TEST_MODE:
     error_test = error_test/n_test
     print("Test error: ", error_test)
 else:
-    sentiment_regressor = SentimentRNN(rnn_model, n_words, embedding_size, hidden_size, output_size, n_layers, dropout, embedding, freeze_embed, output_projection, attention)
+    sentiment_regressor = KaggleSentimentRNN(rnn_model, n_words, embedding_size, hidden_size, output_size, n_layers, dropout, embedding, freeze_embed, output_projection, attention)
     if USE_CUDA:
         sentiment_regressor = sentiment_regressor.cuda(GPU_ID)
     
@@ -350,9 +379,10 @@ else:
     
     scheduler = LambdaLR(regressor_optimizer, lr_lambda=lambda_lr)
     scheduler_on_validation = ReduceLROnPlateau(regressor_optimizer, mode='min', factor=decrease_lr_val_factor, patience=decrease_lr_val_patience, threshold=0.001)
-    criterion = nn.MSELoss()
+    criterion = nn.CrossEntropyLoss()
 
     print_loss_total = 0
+    print_accuracy_total = 0
     losses_train_all = []
     losses_val_all = []
 
@@ -374,6 +404,7 @@ else:
 
         # Loss
         loss = criterion(output, target_tensor)
+        batch_accuracy = accuracy(output, target_tensor)
 
         # Backward
         loss.backward()
@@ -387,33 +418,40 @@ else:
 
         loss = loss.data[0]
         print_loss_total += loss
+        print_accuracy_total += batch_accuracy
         losses_train_all.append(loss)
 
 
         if epoch % print_every == 0:
             # Training error
             print_loss_avg = print_loss_total / print_every
+            print_accuracy_avg = print_accuracy_total / print_every
             print_loss_total = 0
+            print_accuracy_total = 0
 
             # Validation error
             error_val = 0
+            accuracy_val = 0
             for i in range(n_validations):
                 input_tensor, input_lengths, target_tensor = random_batch(inputs_val, targets_val, batch_size)
                 output = sentiment_regressor(input_tensor, input_lengths)
 
                 # Loss
                 loss = criterion(output, target_tensor)
+                batch_accuracy = accuracy(output, target_tensor)
                 error_val += loss.data[0]
+                accuracy_val += batch_accuracy
             
             error_val = error_val/n_validations
+            accuracy_val = accuracy_val/n_validations
             # Adjust learnig rate based on validation error
             if use_ReduceLROnPlateau:
                 scheduler_on_validation.step(error_val)
 
             losses_val_all.append(error_val)
 
-            print_summary = "{0} (Epoch: {1}, Progress: {2:.2f}%) Loss: {3:.4f}, Validation Loss: {4:.4f}".format(
-                time_since(start, epoch / n_epochs), epoch, epoch / n_epochs * 100, print_loss_avg, error_val)
+            print_summary = "{0} (Epoch: {1}, Progress: {2:.2f}%) Loss: {3:.4f} Accuracy: {5:.4f}, Validation Loss: {4:.4f}, Validation Accuracy: {6:.4f}".format(
+                time_since(start, epoch / n_epochs), epoch, epoch / n_epochs * 100, print_loss_avg, error_val, print_accuracy_avg, accuracy_val)
             print(print_summary)
 
             # Early stopping
@@ -437,3 +475,4 @@ else:
 
         if epoch % save_every == 0 and SAVE_MODEL:
             torch.save(sentiment_regressor, "./saved/{0}/{1}/{2}-{3}.{4}".format(CORPUS, "model", "sentiment", FILE_NAME, "pt"))
+
