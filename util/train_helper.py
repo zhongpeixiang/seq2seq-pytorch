@@ -17,7 +17,7 @@ from nltk import bigrams
 from model.corpus import PAD_token, UNK_token, SOS_token, EOS_token
 from util.text_to_tensor import sentences2indexes
 from util.masked_cross_entropy import masked_cross_entropy
-from model.config import USE_CUDA, GPU_ID, USE_AFFECT_ATTN, AFFECT_LOSS_STRENGTH, teacher_forcing_ratio, beam_size, alpha
+from model.config import USE_CUDA, GPU_ID, AFFECT_ATTN, AFFECT_LOSS_STRENGTH, teacher_forcing_ratio, beam_size, alpha, attn_decay
 
 
 # Convert seconds into minutes and seconds
@@ -35,7 +35,7 @@ def time_since(since, percent):
     return "{0} (- {1})".format(as_minutes(s), as_minutes(rs))
 
 # Train model
-def train(input_batches, input_lengths, target_batches, target_lengths, encoder, decoder, encoder_optimizer, decoder_optimizer, criterion, clip=10):
+def train(input_batches, input_lengths, target_batches, target_lengths, encoder, decoder, encoder_optimizer, decoder_optimizer, criterion, clip=5):
     # Zero gradients of both optimizers
     encoder_optimizer.zero_grad()
     decoder_optimizer.zero_grad()
@@ -61,11 +61,12 @@ def train(input_batches, input_lengths, target_batches, target_lengths, encoder,
     max_target_length = max(target_lengths)
     # print("max_target_length: ", max_target_length)
     all_decoder_outputs = Variable(torch.zeros(max_target_length, batch_size, decoder.output_size))
+    batch_attn = Variable(torch.zeros(batch_size, max_target_length, encoder_outputs.size(0))).cuda(GPU_ID) # (batch_size, max_target_len, max_input_len)
 
     if USE_CUDA:
         decoder_input = decoder_input.cuda(GPU_ID)
         all_decoder_outputs = all_decoder_outputs.cuda(GPU_ID)
-    if USE_AFFECT_ATTN:
+    if AFFECT_ATTN is not None:
         affect_embedding = encoder.embedding(input_batches)[:, :, -3:] # Get affect embedding for current input batch, (max_length, batch_size, 3)
         # print(affect_embedding.size())
         # print("---------------------")
@@ -76,12 +77,15 @@ def train(input_batches, input_lengths, target_batches, target_lengths, encoder,
             # print("Decoding at position {0} ...".format(t))
             # start = time.time()
             decoder_output, decoder_hidden, decoder_attn = decoder(decoder_input, decoder_hidden, encoder_outputs, affect_embedding)
-            # print("Decoding at position {0} took  {1}...".format(t, time.time() - start))
             all_decoder_outputs[t] = decoder_output
             decoder_input = target_batches[t] # Next input is current target, fully teacher forcing
+            
+            # decoder_attn: (batch_size, 1, max_length)
+            batch_attn[:,t,:] = decoder_attn.squeeze(1)
     else:
         for t in range(max_target_length):
             decoder_output, decoder_hidden, decoder_attn = decoder(decoder_input, decoder_hidden, encoder_outputs, affect_embedding)
+            
             all_decoder_outputs[t] = decoder_output
 
             # Next input is the predicted word from previous ietration    
@@ -89,6 +93,9 @@ def train(input_batches, input_lengths, target_batches, target_lengths, encoder,
             decoder_input = Variable(topi.squeeze(1))
             if USE_CUDA:
                 decoder_input = decoder_input.cuda(GPU_ID)
+            
+            # decoder_attn: (batch_size, 1, max_length)
+            batch_attn[:,t,:] = decoder_attn.squeeze(1)
     # print("Decoding a random batch took {0:.3f} seconds".format(time.time() - start))
     # Loss and optimization
     # print("Loss and optimization ...")
@@ -99,25 +106,26 @@ def train(input_batches, input_lengths, target_batches, target_lengths, encoder,
         target_lengths
     ) # Variable type, size: [1]
     perplexity_loss = loss.data[0]
-    # print(type(loss))
-    # print(loss.size())
-    # print(loss.data[0])
-    # print("-----------------------")
-    # print(all_decoder_outputs.size())
-    # print(all_decoder_outputs.contiguous().max(2)[1].size())
-    # print(target_batches.size())
+
+    # Attention loss
+    if attn_decay > 0:
+        attn_loss = 0
+        identity_matrix = Variable(torch.FloatTensor(np.eye(batch_attn.size(1)))).cuda(GPU_ID)
+        for idx in range(batch_attn.size(0)):
+            attn_matrix = batch_attn[idx]
+            attn_loss += torch.norm(attn_matrix.mm(attn_matrix.transpose(0, 1)) - identity_matrix)
+        attn_loss = attn_loss/batch_attn.size(0)
+        loss += attn_decay * attn_loss
+
     # Add sentence affect loss
     if AFFECT_LOSS_STRENGTH != 0:
         output_affect_embedding = decoder.embedding(all_decoder_outputs.contiguous().max(2)[1])[:, :, -3:]
         target_affect_embedding = decoder.embedding(target_batches.contiguous())[:, :, -3:]
-        # print(output_affect_embedding)
-        # print(output_affect_embedding.mean(dim=0).mean(dim=0))
-        # print(target_affect_embedding)
-        # print( target_affect_embedding.mean(dim=0).mean(dim=0))
         affect_loss = torch.dist(output_affect_embedding.mean(dim=0).mean(dim=0), target_affect_embedding.mean(dim=0).mean(dim=0))
         # print(affect_loss.data[0])
         loss = (1 - AFFECT_LOSS_STRENGTH)*loss + AFFECT_LOSS_STRENGTH * affect_loss
     
+
     loss.backward()
 
     # Clip gradient norms
@@ -133,55 +141,130 @@ def train(input_batches, input_lengths, target_batches, target_lengths, encoder,
 
 # Calculate greedy similarity between two sentences
 def greedy_similarity(sent1, sent2):
+    # sent1: a non-empty list of word embedding
     greedy_score = 0
-    for word_1 in range(sent1.size(0)):
+    for embed_1 in sent1:
         max_score = 0
-        for word_2 in range(sent2.size(0)):
-            score = 1 - cosine(sent1[word_1].numpy(), sent2[word_2].numpy())
+        for embed_2 in sent2:
+            score = 1 - cosine(embed_1, embed_2)
             if score > max_score:
                 max_score = score
         greedy_score += max_score
-    greedy_score = greedy_score/sent1.size(0)
+    greedy_score = greedy_score/len(sent1)
     return greedy_score
 
+# Calculate average similarity between two sentences
+def avg_similarity(sent1, sent2):
+    # sent1: a non-empty list of word embedding
+    avg_score = 0
+    sum_1 = 0
+    sum_2 = 0
+    for embed in sent1:
+        sum_1 += embed
+    for embed in sent2:
+        sum_2 += embed
+    sum_1 = sum_1/len(sent1)
+    sum_2 = sum_2/len(sent2)
+    avg_score = 1 - cosine(sum_1, sum_2)
+    return avg_score
+
+# Calculate average similarity between two sentences
+def extrema_similarity(sent1, sent2):
+    # sent1: a non-empty list of word embedding
+    extrema_score = 0
+    matrix1 = np.asarray(sent1)
+    matrix2 = np.asarray(sent2)
+    extrema_score = 1 - cosine(np.max(matrix1, axis=0), np.max(matrix2, axis=0))
+    return extrema_score
+
+def affect_distance(sent1, sent2):
+    avg_distance = 0
+    sum_1 = 0
+    sum_2 = 0
+    for embed in sent1:
+        sum_1 += embed
+    for embed in sent2:
+        sum_2 += embed
+    sum_1 = sum_1/len(sent1)
+    sum_2 = sum_2/len(sent2)
+    avg_distance = np.linalg.norm(sum_1 - sum_2)
+    return avg_distance
 
 # Calculate embedding similaries for three modes: greedy matching, average, and extrema
-def embed_similarity(output_embedding, target_embedding):
+def embed_similarity(batch_tokens, target_tokens, output_embedding, target_embedding):
+    # batch_tokens, target_tokens: (batch_size, seq_len)
     # output_embedding: (batch_size, seq_len, embedding_size)
     
     # Calculate greedy similarity
     greedy_score = 0
-    for idx in range(output_embedding.size(0)):
-        output_sent_embed = output_embedding[idx]
-        target_sent_embed = target_embedding[idx]
-
-        greedy_score += 0.5 * (greedy_similarity(output_sent_embed, target_sent_embed) + greedy_similarity(target_sent_embed, output_sent_embed))
-    greedy_score = greedy_score/output_embedding.size(0)
-    
-    # Calculate average similarity
     avg_score = 0
-    for idx in range(output_embedding.size(0)):
-        output_sent_embed = output_embedding[idx]
-        target_sent_embed = target_embedding[idx]
-
-        avg_score += 1 - cosine(output_sent_embed.mean(dim=0).numpy(), target_sent_embed.mean(dim=0).numpy())
-    avg_score = avg_score/output_embedding.size(0)
-
-    # Calculate emtrema similarity
     extrema_score = 0
     for idx in range(output_embedding.size(0)):
-        output_sent_embed = output_embedding[idx]
-        target_sent_embed = target_embedding[idx]
-
-        extrema_score += 1 - cosine(output_sent_embed.max(0)[0].numpy(), target_sent_embed.max(0)[0].numpy())
+        # Iterate through a generated sentence
+        sent1 = []
+        sent2 = []
+        for token_idx, token in enumerate(batch_tokens[idx]):
+            if token == EOS_token:
+                break
+            sent1.append(output_embedding[idx][token_idx].numpy())
+        
+        # Iterate through a target sentence
+        for token_idx, token in enumerate(target_tokens[idx]):
+            if token == EOS_token:
+                break
+            sent2.append(target_embedding[idx][token_idx].numpy())
+        
+        if len(sent1) != 0 and len(sent2) != 0: 
+            greedy_score += 0.5 * (greedy_similarity(sent1, sent2) + greedy_similarity(sent2, sent1))
+            avg_score += avg_similarity(sent1, sent2)
+            extrema_score += extrema_similarity(sent1, sent2)
+    greedy_score = greedy_score/output_embedding.size(0)
+    avg_score = avg_score/output_embedding.size(0)
     extrema_score = extrema_score/output_embedding.size(0)
 
     return greedy_score, avg_score, extrema_score
 
 
+def affect_sent_strength(sent):
+    avg_strength = 0
+    matrix = np.asarray(sent)
+    avg_strength = np.linalg.norm(matrix)/len(sent)
+    return avg_strength
+
+def affect_metrics(batch_tokens, target_tokens, output_affect_embedding, target_affect_embedding):
+    # batch_tokens, target_tokens: (batch_size, seq_len)
+    # output_affect_embedding: (batch_size, seq_len, 3)
+    
+    # Calculate cosine similarity
+    affect_dist = 0
+    affect_strength = 0
+    for idx in range(output_affect_embedding.size(0)):
+        # Iterate through a generated sentence
+        sent1 = []
+        sent2 = []
+        for token_idx, token in enumerate(batch_tokens[idx]):
+            if token == EOS_token:
+                break
+            sent1.append(output_affect_embedding[idx][token_idx].numpy())
+        
+        # Iterate through a target sentence
+        for token_idx, token in enumerate(target_tokens[idx]):
+            if token == EOS_token:
+                break
+            sent2.append(target_affect_embedding[idx][token_idx].numpy())
+        
+        if len(sent1) != 0 and len(sent2) != 0: 
+            affect_dist += affect_distance(sent1, sent2)
+            affect_strength += affect_sent_strength(sent1)
+
+    affect_dist = affect_dist/output_affect_embedding.size(0)
+    affect_strength = affect_strength/output_affect_embedding.size(0)
+    
+    return affect_dist, affect_strength
+
 
 # Validate model using validation set
-def validate(corpus, word_embedding, input_batches, input_lengths, target_batches, target_lengths, encoder, decoder):
+def validate(corpus, word_embedding, affect_embedding_copy, input_batches, input_lengths, target_batches, target_lengths, encoder, decoder):
     loss = 0
     batch_size = len(input_lengths)
     affect_embedding = None
@@ -199,7 +282,7 @@ def validate(corpus, word_embedding, input_batches, input_lengths, target_batche
     if USE_CUDA:
         decoder_input = decoder_input.cuda(GPU_ID)
         all_decoder_outputs = all_decoder_outputs.cuda(GPU_ID)
-    if USE_AFFECT_ATTN:
+    if AFFECT_ATTN is not None:
         affect_embedding = encoder.embedding(input_batches)[:, :, -3:] # Get affect embedding for current input batch, (max_length, batch_size, 3)
     # Run through decoder one by one
     if random.random() <= teacher_forcing_ratio:
@@ -233,25 +316,32 @@ def validate(corpus, word_embedding, input_batches, input_lengths, target_batche
 
     # Distinct-1 and distinct-2
     batch_tokens = all_decoder_outputs.transpose(0, 1).contiguous().max(2)[1].data # batch_tokens: (batch_size, seq_len)
-    distinct1 = 0
-    distinct2 = 0
+    target_tokens = target_batches.transpose(0, 1).contiguous() # (batch_size, seq_len)
+    # print(batch_tokens)
+    batch_unigrams = []
+    batch_bigrams = []
     for idx in range(batch_tokens.size(0)):
-        tokens = [token for token in batch_tokens[idx] if corpus.index2word[token] not in string.punctuation]
-        if len(tokens) != 0:
-            distinct1 += len(set(tokens))/len(tokens)
+        tokens = []
+        for token in batch_tokens[idx]:
+            if token == EOS_token:
+                break
+            if corpus.index2word[token] not in string.punctuation:
+                tokens.append(token)
         bi_grams = [item for item in bigrams(tokens)]
-        if len(bi_grams) != 0:
-            distinct2 += len(set(bi_grams))/len(bi_grams)
-    distinct1 = distinct1/batch_tokens.size(0)
-    distinct2 = distinct2/batch_tokens.size(0)
-
+        batch_unigrams += tokens
+        batch_bigrams += bi_grams
+    
     # Embedding Metrics
     output_embedding = word_embedding(all_decoder_outputs.transpose(0, 1).contiguous().max(2)[1]) # output_embedding: (batch_size, seq, embedding_size)
     target_embedding = word_embedding(target_batches.transpose(0, 1).contiguous()) # target_embedding: (batch_size, seq, embedding_size)
+    embed_greedy, embed_avg, embed_extrema = embed_similarity(batch_tokens.cpu(), target_tokens.cpu().data, output_embedding.cpu().data, target_embedding.cpu().data)
 
-    embed_greedy, embed_avg, embed_extrema = embed_similarity(output_embedding.cpu().data, target_embedding.cpu().data)
+    # Affect Embedding Metrics
+    output_affect_embedding = affect_embedding_copy(all_decoder_outputs.transpose(0, 1).contiguous().max(2)[1]) # output_affect_embedding: (batch_size, seq, 3)
+    target_affect_embedding = affect_embedding_copy(target_batches.transpose(0, 1).contiguous()) # target_affect_embedding: (batch_size, seq, 3)
+    affect_similarity, affect_strength = affect_metrics(batch_tokens.cpu(), target_tokens.cpu().data, output_affect_embedding.cpu().data, target_affect_embedding.cpu().data)
 
-    return perplexity_loss, distinct1, distinct2, embed_greedy, embed_avg, embed_extrema
+    return perplexity_loss, batch_unigrams, batch_bigrams, embed_greedy, embed_avg, embed_extrema, affect_similarity, affect_strength
 
 # Evaluate single word and produce sentence output
 def evaluate(corpus, encoder, decoder, input_seq, max_length):
@@ -288,11 +378,14 @@ def evaluate(corpus, encoder, decoder, input_seq, max_length):
     node_matrix = [[None] * beam_size for _ in range(beam_size)]
     finished_nodes = []
 
-    # Affect embedding
-    if USE_AFFECT_ATTN:
-        affect_embedding = encoder.embedding(input_batches)[:, :, -3:] # Get affect embedding for current input batch, (max_length, batch_size, 3)
-
     for idx in range(max_length):
+        # Affect embedding, to change affect_embedding size
+        if AFFECT_ATTN is not None:
+            if first:
+                affect_embedding = encoder.embedding(input_batches)[:, :, -3:] # Get affect embedding for current input batch, (max_length, batch_size, 3)
+            else:
+                affect_embedding = encoder.embedding(input_batches.repeat(1, beam_size))[:, :, -3:]
+        # Decoder
         decoder_output, decoder_hidden, decoder_attention = decoder(
             decoder_input, decoder_hidden, encoder_outputs, affect_embedding
         )
@@ -399,130 +492,3 @@ def node_length_term(node_length):
     l_term = (((5 + node_length) ** alpha) / ((5 + 1) ** alpha))
     return l_term
 
-
-'''
-# Scorer class for scoring decoder outputs with length normalization
-class GlobalScorer(object):
-    def __init__(self, alpha):
-        self.alpha = alpha
-
-    # Scoring function for decoder outputs
-    def score(self, node):
-        # Length normalization
-        l_term = (((5 + len(beam.next_ys)) ** self.alpha) / ((5 + 1) ** self.alpha))
-        return log_probs / l_term
-
-
-def print_scores(node_matrix):
-    print("\n")
-    for i in range(len(node_matrix)):
-        for j in range(len(node_matrix[i])):
-            print(node_matrix[i][j].score, end=', ')
-        print("\n")
-
-
-def print_list_scores(node_list):
-    print("\n")
-    print(len(node_list))
-    for i in range(len(node_list)):
-        print(node_list[i].score, end=', ')
-    print("\n")
-
-
-
-# Beam search
-class Beam(object):
-    def __init__(self, beam_size, global_scorer, n_best = 1):
-        self.beam_size = beam_size
-
-        self.tt = torch.cuda if USE_CUDA else torch
-
-        # Initialize scores for all beams
-        self.scores = self.tt.FloatTensor(beam_size).zero_()
-        self.all_scores = []
-
-        # The backpointers at each time step
-        self.prev_ks = []
-
-        # The outputs at each time step
-        self.next_ys = [self.tt.LongTensor(beam_size).fill_(PAD_token)]
-        self.next_ys[0][0] = SOS_token
-        self.eos_top = False
-
-        self.finished = []
-        self.n_best = n_best
-
-        # Global scoring
-        self.global_scorer = global_scorer
-
-    # Get current outputs for current time step
-    def get_current_state(self):
-        return self.next_ys[-1]
-
-    # Get the backpointers for current time step
-    def get_current_origin(self):
-        return self.prev_ks[-1]
-
-    def advance(self, word_lk):
-        num_words = word_lk.size(1)
-
-        # Sum previous scores
-        if len(self.prev_ks) > 0:
-            beam_lk = word_lk + self.scores.unsqueeze(1).expand_as(word_lk)
-
-            for i in range(self.next_ys[-1]).size(0):
-                if self.next_ys[-1][i] == EOS_token:
-                    beam_lk[i] = -1e20
-        else:
-            beam_lk = word_lk[0]
-        
-        # Top beam_size scores
-        best_scores, best_scores_id = beam_lk.view(-1).topk(self.beam_size, 0, True, True)
-
-        self.all_scores.append(self.scores)
-        self.scores = best_scores
-
-        # Calculate which word and beam each score came from
-        prev_k = best_scores_id/num_words
-        self.prev_ks.append(prev_k)
-        self.next_ys.append((best_scores_id - prev_k * num_words))
-
-        for i in range(self.next_ys[-1].size(0)):
-            if self.next_ys[-1][i] == EOS_token:
-                s = self.scores[i]
-                global_scores = self.global_scorer.score(self, self.scores)
-                s = global_scores[i]
-                self.finished.append((s, len(self.next_ys) - 1, i))
-
-        # End condition is when top-of-beam is EOS and no global score
-        if self.next_ys[-1][0] == EOS_token:
-            self.eos_top = True
-        
-    def done(self):
-        return self.eos_top and len(self.finished) >= self.n_best
-
-    def sort_finished(self, minimum=None):
-        if minimum is not None:
-            i = 0
-            while len(self.finished) < minimum:
-                s = self.scores[i]
-                global_scores = self.global_scorer.score(self, self.scores)
-                s = global_scores[i]
-                self.finished.append((s, len(self.next_ys) - 1, i))
-        self.finished.sort(key=lambda a: -a[0])
-        scores = [sc for sc, _, _ in self.finished]
-        ks = [(t, k) for _, t, k in self.finished]
-        return scores, ks
-
-    def get_hypothesis(self, timestep, k):
-        # Walk back to construct the full hypothesis
-        hyp = []
-
-        for j in range(len(self.prev_ks[:timestep]) - 1, -1, -1):
-            hyp.append(self.next_ys[j+1][k])
-            k = self.prev_ks[j][k]
-        return hyp[::-1]
-
-'''
-
-            

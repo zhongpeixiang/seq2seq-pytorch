@@ -13,7 +13,13 @@ from model.config import USE_CUDA, GPU_ID
 
 # Convert each word in a sentence into its index
 def sentences2indexes(corpus, sentence):
-    return [corpus.word2index[word] for word in sentence.split(" ")] + [EOS_token]
+    indexes = []
+    for word in sentence.split(" "):
+        if word in corpus.word2index:
+            indexes.append(corpus.word2index[word])
+        else:
+            indexes.append(UNK_token)
+    return indexes + [EOS_token]
 
 # Pad a sequence to max_length using PAD token
 def pad_seq(seq, max_length):

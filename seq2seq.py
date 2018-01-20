@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 from torch.autograd import Variable
 from torch import optim
+from torch.optim.lr_scheduler import LambdaLR, ReduceLROnPlateau
 from gensim.models.keyedvectors import KeyedVectors
 
 import nltk
@@ -46,8 +47,6 @@ print()
 if LOAD_CORPUS:
     corpus = load_object("./saved/{5}/corpus/corpus-min-{0}-vocab-{1}-lengths-{2}-{3}-replace-{6}-reversed-{4}.pkl".format(MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, REVERSE_INPUT, CORPUS, REPLACE_UNK))
     pairs = load_object("./saved/{5}/corpus/pairs-min-{0}-vocab-{1}-lengths-{2}-{3}-replace-{6}-reversed-{4}.pkl".format(MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, REVERSE_INPUT, CORPUS, REPLACE_UNK))
-    print("Vocab size: ", corpus.n_words)
-    print("Number of samples: ", len(pairs))
 else:
     # Load file, indexed words and split into pairs
     corpus, pairs = prepare_data(USE_DIR + DATA_FILE)
@@ -69,8 +68,6 @@ else:
     else:
         # Remove pairs that contain unknown words
         pairs = remove_UNK(corpus, pairs)
-    print("Vocab size: ", corpus.n_words)
-    print("Number of samples: ", len(pairs))
 
     # Save objects
     if SAVE_CORPUS:
@@ -80,6 +77,17 @@ else:
     # If intend to create corpus only, exit now
     if CREATE_CORPUS_ONLY:
         sys.exit()
+
+# Print corpus info
+print("Vocab size: ", corpus.n_words)
+print("Number of samples: ", len(pairs))
+num_words = 0
+for pair in pairs:
+    num_words += len(pairs[0])
+    num_words += len(pairs[1])
+print("Number of words: ", num_words)
+print("Sample pair: ")
+print(pairs[random.randint(0, len(pairs) - 1)])
 
 
 ####################
@@ -117,7 +125,7 @@ if LOAD_WORD2VEC:
                 counter += 1
                 embedding[word_id] = word_vectors.word_vec(word)
             else:
-                embedding[word_id] = np.random.uniform(-0.1, 0.1, size=300)
+                embedding[word_id] = np.random.normal(loc=0, scale=1/np.sqrt(word_vectors.vector_size), size=word_vectors.vector_size)
         
         if SAVE_NUMPY_WORD2VEC:
             path = "./saved/{5}/corpus/corpus-min-{0}-vocab-{1}-lengths-{2}-{3}-replace-{6}-reversed-{4}.npy".format(MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, REVERSE_INPUT, CORPUS, REPLACE_UNK)
@@ -177,6 +185,10 @@ if LOAD_WORD2VEC:
         embedding = embedding * affect_coefficients.T # Multiply weights to balance word2vec embedding and affect embedding
         del word2vad
         
+        # Keep a copy of original affect embedding
+        affect_embedding_copy = nn.Embedding(corpus.n_words, 3)
+        affect_embedding_copy.weight.data.copy_(torch.from_numpy(affect_embedding))
+        affect_embedding_copy = affect_embedding_copy.cuda(GPU_ID)
 
 # Train, validation and test split
 print("Spliting into training, validation and test sets")
@@ -205,29 +217,60 @@ print("### Training Details")
 print("####################")
 print()
 
-FILE_NAME = "min-{0}-vocab-{1}-lengths-{2}-{3}-affect-{14}-atten-{4}-embed-{5}-word2vec-{12}-hidden-{6}-layers-{7}-dropout-{8}-epochs-{14}-batch-{9}-teacher-{10}-learn-{11}-id-{13}".format(
+FILE_NAME = "min-{0}-vocab-{1}-lengths-{2}-{3}-affect-{15}-atten-{4}-embed-{5}-word2vec-{12}-hidden-{6}-layers-{7}-dropout-{8}-epochs-{14}-batch-{9}-teacher-{10}-learn-{11}-id-{13}".format(
             MIN_COUNT, VOCAB_SIZE, MIN_LENGTH, MAX_LENGTH, attn_model, embedding_size, hidden_size, n_layers, dropout, 
             str(ordered_batch) + "_" + str(batch_size), teacher_forcing_ratio, learning_rate, LOAD_WORD2VEC, model_identifier, n_epochs, 
-            str(USE_AFFECT_EMBEDDING) + "_" + str(AFFECT_EMBEDDING_STRENGTH) + "_" + str(USE_AFFECT_ATTN) + "_" + str(AFFECT_LOSS_STRENGTH))
+            str(USE_AFFECT_EMBEDDING) + "_" + str(AFFECT_EMBEDDING_STRENGTH) + "_" + str(AFFECT_ATTN) + "_" + str(AFFECT_LOSS_STRENGTH))
 
 if LOAD_MODEL:
-    print("Loading model...")
-    encoder = torch.load("./saved/{0}/{1}/{2}-{3}.{4}".format(CORPUS, "model", "encoder", FILE_NAME, "pt"))
-    decoder = torch.load("./saved/{0}/{1}/{2}-{3}.{4}".format(CORPUS, "model", "decoder", FILE_NAME, "pt"))
+    print("Loading model from ", "./saved/{0}/{1}/{2}-{3}.{4}".format(CORPUS, "model", "encoder", FILE_NAME, "pt"))
+    encoder = EncoderRNN(corpus.n_words, embedding_size, hidden_size, n_layers, dropout=dropout, embedding=embedding)
+    decoder = LuongAttnDecoderRNN(attn_model, bigram_attn, embedding_size, hidden_size, corpus.n_words, n_layers, dropout=dropout, embedding=embedding, affect_attn=AFFECT_ATTN)
+    encoder.load_state_dict(torch.load("./saved/{0}/{1}/{2}-{3}.{4}".format(CORPUS, "model", "encoder", FILE_NAME, "pt")))
+    decoder.load_state_dict(torch.load("./saved/{0}/{1}/{2}-{3}.{4}".format(CORPUS, "model", "decoder", FILE_NAME, "pt")))
+
+    if USE_CUDA:
+        encoder.cuda(GPU_ID)
+        decoder.cuda(GPU_ID)
     
     print("Start evaluating...")
     while epoch < n_epochs:
         epoch += 1
-        evaluate_randomly(corpus, pairs_test, encoder, decoder, 10)
+        evaluate_randomly(corpus, pairs_test, encoder, decoder, MAX_LENGTH)
 else:
     # Initialize model
     encoder = EncoderRNN(corpus.n_words, embedding_size, hidden_size, n_layers, dropout=dropout, embedding=embedding)
-    decoder = LuongAttnDecoderRNN(attn_model, embedding_size, hidden_size, corpus.n_words, n_layers, dropout=dropout, embedding=embedding, use_affect=USE_AFFECT_ATTN)
+    decoder = LuongAttnDecoderRNN(attn_model, bigram_attn, embedding_size, hidden_size, corpus.n_words, n_layers, dropout=dropout, embedding=embedding, affect_attn=AFFECT_ATTN)
+    
+    # Total number of params
+    encoder_num_params = 0
+    decoder_num_params = 0
+    for param in encoder.parameters():
+        product = 1
+        for dim in range(len(param.data.size())):
+            product *= param.data.size(dim)
+        encoder_num_params += product
+    
+    for param in decoder.parameters():
+        product = 1
+        for dim in range(len(param.data.size())):
+            product *= param.data.size(dim)
+        decoder_num_params += product
+    # encoder_num_params = 6*hidden_size*((3*n_layers - 2)*hidden_size + embedding_size + 2*n_layers)
+    # decoder_num_params = hidden_size*((6*n_layers - 1)*hidden_size + 3*embedding_size + 6*n_layers + corpus.n_words + 1) + corpus.n_words
+    print("Number of params: encoder ({0:,}), decoder ({1:,}), total ({2:,})".format(encoder_num_params, decoder_num_params, encoder_num_params + decoder_num_params))
 
     # Initialize optimizers and criterion
-    encoder_optimizer = optim.Adam(encoder.parameters(), lr=learning_rate)
-    decoder_optimizer = optim.Adam(decoder.parameters(), lr=learning_rate * decoder_learning_ratio)
+    encoder_optimizer = optim.Adam(encoder.parameters(), lr=learning_rate, weight_decay=L2_decay)
+    decoder_optimizer = optim.Adam(decoder.parameters(), lr=learning_rate * decoder_learning_ratio, weight_decay=L2_decay)
     criterion = nn.CrossEntropyLoss()
+
+    # Learning rate annealing
+    lambda_lr = lambda epoch: 0.5 ** (epoch//decrease_lr_every)
+    encoder_scheduler = LambdaLR(encoder_optimizer, lr_lambda=lambda_lr)
+    encoder_scheduler_on_validation = ReduceLROnPlateau(encoder_optimizer, mode='min', factor=decrease_lr_val_factor, patience=decrease_lr_val_patience, threshold=0.001)
+    decoder_scheduler = LambdaLR(decoder_optimizer, lr_lambda=lambda_lr)
+    decoder_scheduler_on_validation = ReduceLROnPlateau(decoder_optimizer, mode='min', factor=decrease_lr_val_factor, patience=decrease_lr_val_patience, threshold=0.001)
 
     if USE_CUDA:
         encoder.cuda(GPU_ID)
@@ -240,9 +283,18 @@ else:
     losses_val_all = []
     losses_val = []
 
+    # Create a file to save validation metrics
+    val_metrics_file = "./saved/{0}/{1}/{2}-{3}.{4}".format(CORPUS, "loss", "metrics", FILE_NAME, "txt")
+    with open(val_metrics_file, "w") as f:
+        f.write("loss,perplexity,distinct-1,distinct-2,embed_greedy,embed_avg,embed_extrema,affect_distance,affect_strength\n")
+
     print("Start training...")
     while epoch < n_epochs:
         epoch += 1
+
+        if use_LambdaLR:
+            encoder_scheduler.step()
+            decoder_scheduler.step()
         
         # Learning rate annealing
         # if epoch % 10000 == 0 or epoch % 15000 == 0 or epoch % 18000 == 0:
@@ -284,36 +336,56 @@ else:
 
             # Validation metrics
             error_val = 0
+            all_unigrams = []
+            all_bigrams = []
             distinct1 = 0
             distinct2 = 0
             embed_greedy = 0
             embed_avg = 0
             embed_extrema = 0
+            affect_distance = 0
+            affect_strength = 0
             for i in range(n_validations):
                 input_batches, input_lengths, target_batches, target_lengths = random_batch(corpus, pairs_val, batch_size)
-                eval_metrics = validate(corpus, word_embedding, input_batches, input_lengths, target_batches, target_lengths, encoder, decoder)
+                eval_metrics = validate(corpus, word_embedding, affect_embedding_copy, input_batches, input_lengths, target_batches, target_lengths, encoder, decoder)
                 # print(eval_metrics)
                 error_val += eval_metrics[0]
-                distinct1 += eval_metrics[1]
-                distinct2 += eval_metrics[2]
+                all_unigrams += eval_metrics[1]
+                all_bigrams += eval_metrics[2]
                 embed_greedy += eval_metrics[3]
                 embed_avg += eval_metrics[4]
                 embed_extrema += eval_metrics[5]
+                affect_distance += eval_metrics[6]
+                affect_strength += eval_metrics[7]
             
             error_val = error_val/n_validations
-            distinct1 = distinct1/n_validations
-            distinct2 = distinct2/n_validations
+            if len(all_unigrams) != 0:
+                distinct1 = len(set(all_unigrams))/len(all_unigrams)
+            if len(all_bigrams) != 0:
+                distinct2 = len(set(all_bigrams))/len(all_bigrams)
             embed_greedy = embed_greedy/n_validations
             embed_avg = embed_avg/n_validations
             embed_extrema = embed_extrema/n_validations
+            affect_distance = affect_distance/n_validations
+            affect_strength = affect_strength/n_validations
             perplexity_val = math.exp(float(error_val)) if error_val < 300 else float("inf")
             losses_val.append(error_val)
             losses_val_all.append(error_val)
 
-            print_summary = "{0} (Epoch: {1}, Progress: {2:.2f}%) Loss: {3:.2f}, Perplexity: {4:.2f}. Validation Loss: {5:.2f}, Validation Perplexity: {6:.2f}, \
-            Distinct-1: {7:.3f}, Distinct-2: {8:.3f}, Embed-greedy: {9:.3f}, Embed-avg: {10:.3f}, Embed-extrema: {11:.3f}".format(
-                time_since(start, epoch / n_epochs), epoch, epoch / n_epochs * 100, print_loss_avg, perplexity, error_val, perplexity_val, distinct1, distinct2, embed_greedy, embed_avg, embed_extrema)
+            print_summary = "{0} (Epoch: {1}, Progress: {2:.2f}%) Loss: {3:.2f}, Perplexity: {4:.2f}. Validation ({12:,} samples) Loss: {5:.2f}, Validation Perplexity: {6:.2f}, \
+            Distinct-1: {7:.6f}, Distinct-2: {8:.6f}, Embed-greedy: {9:.3f}, Embed-avg: {10:.3f}, Embed-extrema: {11:.3f}, Affect-distance: {13:.3f}, Affect-strength: {14:.3f}".format(
+                time_since(start, epoch / n_epochs), epoch, epoch / n_epochs * 100, print_loss_avg, perplexity, error_val, perplexity_val, distinct1, distinct2, 
+                embed_greedy, embed_avg, embed_extrema, n_validations * batch_size, affect_distance, affect_strength)
             print(print_summary)
+
+            # Save validation metrics file
+            with open(val_metrics_file, "a") as f:
+                f.write("{0},{1},{2},{3},{4},{5},{6},{7},{8}\n".format(error_val,perplexity_val,distinct1,distinct2,embed_greedy,embed_avg,embed_extrema,affect_distance,affect_strength))
+
+            # Adjust learnig rate based on validation error
+            if use_ReduceLROnPlateau:
+                encoder_scheduler_on_validation.step(error_val)
+                decoder_scheduler_on_validation.step(error_val)
 
             # Early stopping
             if early_stopping:
@@ -338,5 +410,6 @@ else:
             evaluate_randomly(corpus, pairs_test, encoder, decoder, MAX_LENGTH)
 
         if epoch % save_every == 0 and SAVE_MODEL:
-            torch.save(encoder, "./saved/{0}/{1}/{2}-{3}.{4}".format(CORPUS, "model", "encoder", FILE_NAME, "pt"))
-            torch.save(decoder, "./saved/{0}/{1}/{2}-{3}.{4}".format(CORPUS, "model", "decoder", FILE_NAME, "pt"))
+            print("Saving model to ", "./saved/{0}/{1}/{2}-{3}.{4}".format(CORPUS, "model", "encoder", FILE_NAME, "pt"))
+            torch.save(encoder.state_dict(), "./saved/{0}/{1}/{2}-{3}.{4}".format(CORPUS, "model", "encoder", FILE_NAME, "pt"))
+            torch.save(decoder.state_dict(), "./saved/{0}/{1}/{2}-{3}.{4}".format(CORPUS, "model", "decoder", FILE_NAME, "pt"))
